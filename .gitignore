@@ -1,0 +1,18 @@
+# Build output (build/, build_thingy/, build-*/ — at any depth)
+build/
+build-*/
+build_*/
+
+# Licensed Nordic DECT NR+ modem firmware — NEVER commit (per license agreement)
+dectfw/
+
+# Session logs / scratch
+*.log
+*.exit
+
+# Python / tooling
+*.pyc
+.venv/
+
+# Local editor / agent config
+.claude/

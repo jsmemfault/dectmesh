@@ -1,0 +1,19 @@
+/*
+ * Copyright (c) 2026 Jon Sharp
+ * SPDX-License-Identifier: MIT
+ *
+ * Memfault heartbeat metrics for the DECT NR+ / Æther HONR mesh. Reported each
+ * heartbeat interval from the live mesh context (see dect_metrics.c).
+ */
+
+/* Topology / HONR state. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_neighbors, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_routes, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_honr_rank, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_honr_joined, kMemfaultMetricType_Unsigned)
+
+/* Traffic counters (cumulative, reported as gauges). */
+MEMFAULT_METRICS_KEY_DEFINE(dect_hello_sent, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_hello_recv, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_forwarded, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_dropped, kMemfaultMetricType_Unsigned)

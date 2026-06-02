@@ -1,0 +1,114 @@
+#
+# Copyright (c) 2026 Jon Sharp
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+menu "DECT NR+ Mesh"
+
+config DECT_MESH_CARRIER
+	int "DECT NR+ carrier (channel) number"
+	default 0
+	help
+	  Channel availability and the rules for using it vary by country and
+	  region. See ETSI TS 103 636-2 section 5.4.2 for the calculation. A
+	  value of 0 fails the build on purpose: set the carrier deliberately
+	  for your region (see overlay-eu.conf and overlay-us.conf).
+
+config DECT_MESH_NETWORK_ID
+	int "DECT NR+ network ID"
+	range 1 4294967295
+	default 91
+	help
+	  Network identifier shared by all nodes in the mesh. Only frames whose
+	  short network ID matches are received.
+
+config DECT_MESH_MCS
+	int "Modulation and coding scheme (MCS) index"
+	range 0 4
+	default 1
+	help
+	  Higher MCS values carry more data per subslot at the cost of range
+	  and robustness.
+
+config DECT_MESH_TX_POWER
+	int "Transmit power index"
+	range 0 13
+	default 13
+	help
+	  Transmit power setting. See table 6.2.1-3 of ETSI TS 103 636-4. Lower
+	  values for bench testing reduce interference between nearby nodes.
+
+config DECT_MESH_NODE_ID
+	int "Mesh node ID (0 derives the ID from the hardware ID)"
+	range 0 65535
+	default 0
+	help
+	  Address of this node in the mesh. Leave at 0 to derive a unique ID
+	  from the device hardware ID, or set a small fixed value to make a
+	  multi-node test topology easier to read in the logs.
+
+config DECT_MESH_DEFAULT_TTL
+	int "Default message time-to-live in hops"
+	range 1 16
+	default 4
+	help
+	  Maximum number of hops an originated message may travel before nodes
+	  stop relaying it.
+
+config DECT_MESH_ORIGINATE_INTERVAL_SECONDS
+	int "Interval between originated messages in seconds (0 relays only)"
+	range 0 3600
+	default 10
+	help
+	  How often this node originates a broadcast message. Set to 0 for a
+	  relay-only node that forwards traffic but never originates its own.
+
+config DECT_MESH_RX_WINDOW_SECONDS
+	int "Receive window duration in seconds"
+	range 1 60
+	default 3
+	help
+	  Duration of each continuous receive window between transmit bursts.
+
+config DECT_MESH_DEDUP_CACHE_SIZE
+	int "Duplicate-suppression cache size in entries"
+	range 4 256
+	default 32
+	help
+	  Number of recently seen (source, message) pairs remembered to stop
+	  relay loops. Size it above the number of messages in flight across the
+	  mesh within one TTL lifetime.
+
+config DECT_MESH_MAX_NEIGHBORS
+	int "Maximum tracked one-hop neighbors"
+	range 1 64
+	default 16
+
+config DECT_MESH_NEIGHBOR_TIMEOUT_SECONDS
+	int "Neighbor inactivity timeout in seconds"
+	range 1 3600
+	default 60
+	help
+	  A neighbor not heard from within this time is excluded from the active
+	  neighbor count.
+
+config DECT_MESH_RX_QUEUE_DEPTH
+	int "Inbound frame queue depth in frames"
+	range 2 64
+	default 8
+
+config DECT_MESH_TX_QUEUE_DEPTH
+	int "Outbound frame queue depth in frames"
+	range 2 64
+	default 8
+
+module = DECT_MESH
+module-str = DECT NR+ Mesh
+source "$(ZEPHYR_BASE)/subsys/logging/Kconfig.template.log_config"
+
+endmenu
+
+menu "Zephyr Kernel"
+source "Kconfig.zephyr"
+endmenu

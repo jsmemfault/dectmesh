@@ -1,0 +1,33 @@
+/*
+ * Relay overlay: the relay's own console/logs go to RTT. The two inter-chip
+ * links to the nRF9151 are uart1 (9P /net/aether transport) and uart0 (the
+ * 9151's console/shell). uart1 is pumped to BLE L2CAP; uart0 is pumped to a
+ * USB CDC ACM port so the host can drive the 9151 shell (dect bands/info/cad).
+ */
+
+/ {
+	chosen {
+		zephyr,console = &rtt0;
+	};
+};
+
+/* 9151 9P transport (its uart1) -> BLE L2CAP. */
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/* 9151 console/shell (its uart0) -> USB CDC ACM. */
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/* USB CDC ACM port exposing the 9151 console to the host. The board already
+ * defines &usbd (nordic,nrf-usbd) + a cdc_acm_uart0; re-stating it here keeps
+ * the relay self-documenting and independent of board-file changes. */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

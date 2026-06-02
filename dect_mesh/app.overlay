@@ -1,0 +1,17 @@
+/*
+ * 9P transport UART. The /net/aether 9P server runs on this UART, separate from
+ * the console (uart0). On the Thingy:91X, uart1 is an inter-chip link to the
+ * nRF5340, which relays it to BLE L2CAP for clients. On a DK, uart1 is the
+ * second VCOM, so the server can be reached directly for bring-up testing.
+ */
+
+/ {
+	chosen {
+		zephyr,ninep-uart = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+};
