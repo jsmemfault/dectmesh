@@ -23,6 +23,12 @@
 #include <zephyr/bluetooth/l2cap.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/sys/reboot.h>
+#include <zephyr/dfu/mcuboot.h>
+#include <zephyr/9p/server.h>
+#include <zephyr/9p/session_pool_uart.h>
+#include <zephyr/9p/sysfs.h>
+#include <zephyr/9p/dfu.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(dect_relay, LOG_LEVEL_INF);
@@ -60,6 +66,7 @@ struct bridge_ep {
 	const struct device *peer;
 	struct ring_buf *rx_ring; /* bytes read from self queue here (-> peer TX) */
 	struct ring_buf *tx_ring; /* bytes written to self drain from here */
+	bool peer_needs_dtr;      /* peer is a CDC ACM: only pump when host attached */
 };
 static struct bridge_ep cons_ep; /* self = uart0 (9151 console) */
 static struct bridge_ep cdc_ep;  /* self = CDC ACM (host)       */
@@ -70,6 +77,19 @@ static void bridge_isr(const struct device *dev, void *user_data)
 
 	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
 		if (uart_irq_rx_ready(dev)) {
+			/* If the peer is a CDC ACM with no host attached (DTR low),
+			 * drop the data instead of backing up its TX endpoint -- that
+			 * backup floods usb_transfer "No transfer slot available" and
+			 * starves the other CDC ports (e.g. the 9P server on cdc1). */
+			if (ep->peer_needs_dtr) {
+				uint32_t dtr = 0;
+				(void)uart_line_ctrl_get(ep->peer, UART_LINE_CTRL_DTR, &dtr);
+				if (!dtr) {
+					uint8_t drop[64];
+					(void)uart_fifo_read(dev, drop, sizeof(drop));
+					continue;
+				}
+			}
 			uint8_t *dst;
 			uint32_t space = ring_buf_put_claim(ep->rx_ring, &dst, 64);
 
@@ -105,15 +125,124 @@ static void console_bridge_init(void)
 {
 	cons_ep = (struct bridge_ep){ .self = cons_uart, .peer = cdc_uart,
 				      .rx_ring = &cons_to_host_rb,
-				      .tx_ring = &host_to_cons_rb };
+				      .tx_ring = &host_to_cons_rb,
+				      .peer_needs_dtr = true };  /* peer = CDC: gate on host DTR */
 	cdc_ep = (struct bridge_ep){ .self = cdc_uart, .peer = cons_uart,
 				     .rx_ring = &host_to_cons_rb,
-				     .tx_ring = &cons_to_host_rb };
+				     .tx_ring = &cons_to_host_rb,
+				     .peer_needs_dtr = false }; /* peer = real uart0, always ready */
 
 	uart_irq_callback_user_data_set(cons_uart, bridge_isr, &cons_ep);
 	uart_irq_callback_user_data_set(cdc_uart, bridge_isr, &cdc_ep);
 	uart_irq_rx_enable(cons_uart);
 	uart_irq_rx_enable(cdc_uart);
+}
+
+/* ---- Firmware-as-files: 9P session pool on cdc_acm_uart1 (phase 2) ----
+ *
+ * A 9p4z server exposing the 5340's own MCUboot DFU as /dev/fw5340, plus
+ * /dev/confirm and /dev/reboot, over a dedicated USB CDC ACM port. The host can
+ * `9p write /dev/fw5340 <signed.bin>` to self-update the 5340 in situ, then
+ * write /dev/confirm to make it permanent (else MCUboot reverts).
+ *
+ * The CDC stream is served through a DTR-gated session pool: each host
+ * open/close of the port allocates/frees a fresh session (RX state + fid
+ * namespace), so the server no longer wedges on client reconnect the way a
+ * single long-lived stream server did. Phase 3 folds in a 9P client link to the
+ * 9151 + union_fs to re-export /dev/fw9151 + /net/aether onto the same shared
+ * fs_ops, served by both this pool and an L2CAP session pool. The existing
+ * uart1<->L2CAP byte-pump is untouched, so /net/aether-over-BLE keeps working.
+ */
+static const struct device *const fw_cdc = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart1));
+NINEP_SESSION_POOL_UART_DEFINE(fw_uart_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
+static struct ninep_sysfs fw_sysfs;
+static struct ninep_sysfs_entry fw_sysfs_entries[8];
+static struct ninep_dfu fw_dfu;
+
+static int fw_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(buf); ARG_UNUSED(off); ARG_UNUSED(ctx);
+	LOG_INF("reboot requested via 9P");
+	k_sleep(K_MSEC(100)); /* let logs flush */
+	sys_reboot(SYS_REBOOT_COLD);
+	return count; /* unreached */
+}
+
+static int fw_write_confirm(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(buf); ARG_UNUSED(off); ARG_UNUSED(ctx);
+	int ret = ninep_dfu_confirm();
+
+	if (ret == 0) {
+		LOG_INF("5340 image confirmed via 9P");
+	}
+	return ret < 0 ? ret : count;
+}
+
+static void fw_dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
+{
+	ARG_UNUSED(bytes);
+	switch (state) {
+	case NINEP_DFU_ERASING:  LOG_INF("fw5340 DFU: erasing secondary slot"); break;
+	case NINEP_DFU_COMPLETE: LOG_INF("fw5340 DFU: complete - reboot to apply"); break;
+	case NINEP_DFU_ERROR:    LOG_ERR("fw5340 DFU: error %d", err); break;
+	default: break;
+	}
+}
+
+static int fw_9p_init(void)
+{
+	int err;
+
+	if (!device_is_ready(fw_cdc)) {
+		LOG_ERR("fw 9P CDC not ready");
+		return -ENODEV;
+	}
+
+	err = ninep_sysfs_init(&fw_sysfs, fw_sysfs_entries, ARRAY_SIZE(fw_sysfs_entries));
+	if (err) {
+		LOG_ERR("fw sysfs init: %d", err);
+		return err;
+	}
+	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/reboot",
+						 NULL, fw_write_reboot, NULL);
+	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/confirm",
+						 NULL, fw_write_confirm, NULL);
+
+	struct ninep_dfu_config dfu_cfg = {
+		.path = "dev/fw5340",
+		.status_cb = fw_dfu_status,
+	};
+	err = ninep_dfu_init(&fw_dfu, &fw_sysfs, &dfu_cfg);
+	if (err) {
+		LOG_ERR("fw5340 DFU init: %d", err);
+		return err;
+	}
+
+	struct ninep_session_pool_uart_config pool_cfg = {
+		.uart_dev = fw_cdc,
+		.max_sessions = 1,
+		.rx_buf_size_per_session = CONFIG_NINEP_MAX_MESSAGE_SIZE,
+		.fs_ops = ninep_sysfs_get_ops(),
+		.fs_context = &fw_sysfs,
+	};
+	err = ninep_session_pool_uart_init(&fw_uart_pool, &pool_cfg);
+	if (err) {
+		LOG_ERR("fw 9P session pool init: %d", err);
+		return err;
+	}
+	err = ninep_session_pool_uart_start(&fw_uart_pool);
+	if (err) {
+		LOG_ERR("fw 9P session pool start: %d", err);
+		return err;
+	}
+
+	if (!boot_is_img_confirmed()) {
+		LOG_WRN("5340 image not confirmed - write /dev/confirm or it reverts on reboot");
+	}
+	LOG_INF("fw 9P session pool up on cdc_acm_uart1 (DTR-gated): "
+		"/dev/fw5340, /dev/confirm, /dev/reboot");
+	return 0;
 }
 
 /* L2CAP TX SDU pool. */
@@ -304,6 +433,10 @@ int main(void)
 	} else {
 		console_bridge_init();
 		LOG_INF("USB CDC console bridge up (9151 shell -> USB serial)");
+		err = fw_9p_init();
+		if (err) {
+			LOG_ERR("fw 9P server init failed: %d", err);
+		}
 	}
 
 	err = bt_enable(NULL);

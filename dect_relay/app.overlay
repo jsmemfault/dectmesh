@@ -1,13 +1,12 @@
 /*
- * Relay overlay: the relay's own console/logs go to RTT. The two inter-chip
- * links to the nRF9151 are uart1 (9P /net/aether transport) and uart0 (the
- * 9151's console/shell). uart1 is pumped to BLE L2CAP; uart0 is pumped to a
- * USB CDC ACM port so the host can drive the 9151 shell (dect bands/info/cad).
+ * Relay overlay. Inter-chip links to the nRF9151: uart1 (9P /net/aether) and
+ * uart0 (the 9151's console/shell). Three USB CDC ACM ports front it all:
+ *   cdc0 = 9151 console   cdc1 = 9P   cdc2 = the 5340's OWN console.
  */
 
 / {
 	chosen {
-		zephyr,console = &rtt0;
+		zephyr,console = &cdc_acm_uart2;  /* relay's own log -> USB (CDC2) */
 	};
 };
 
@@ -23,11 +22,19 @@
 	current-speed = <115200>;
 };
 
-/* USB CDC ACM port exposing the 9151 console to the host. The board already
- * defines &usbd (nordic,nrf-usbd) + a cdc_acm_uart0; re-stating it here keeps
- * the relay self-documenting and independent of board-file changes. */
+/* Composite USB: THREE CDC ACM ports (max on nRF5340: 2 IN + 1 OUT eps each).
+ *   cdc_acm_uart0 -> 9151 console/shell (byte-pump from uart0)
+ *   cdc_acm_uart1 -> 9P (aggregator re-export server / pump to the 9151)
+ *   cdc_acm_uart2 -> the 5340's OWN console (this relay's log over USB)
+ * The board defines &usbd (nordic,nrf-usbd); we add the CDC ACM functions. */
 &zephyr_udc0 {
 	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+	cdc_acm_uart1: cdc_acm_uart1 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+	cdc_acm_uart2: cdc_acm_uart2 {
 		compatible = "zephyr,cdc-acm-uart";
 	};
 };
