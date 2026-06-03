@@ -20,6 +20,9 @@
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/transport_uart.h>
+#include <zephyr/9p/dfu.h>
+#include <zephyr/dfu/mcuboot.h>
+#include <zephyr/sys/reboot.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -34,7 +37,8 @@ extern struct aether_mesh_ctx *g_mesh_ctx;
 static struct ninep_transport transport;
 static struct ninep_server server;
 static struct ninep_sysfs sysfs;
-static struct ninep_sysfs_entry sysfs_entries[16];
+static struct ninep_sysfs_entry sysfs_entries[24];
+static struct ninep_dfu dfu;
 static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 static struct net_if *g_iface;
 
@@ -244,6 +248,76 @@ static int write_chat(const uint8_t *buf, uint32_t count, uint64_t off, void *ct
 	return count;
 }
 
+/* ---- Firmware-as-files: /dev/firmware (this 9151's own MCUboot DFU) ----
+ *
+ * ninep_dfu streams a signed image into the MCUboot secondary slot, which on
+ * the Thingy:91 X 9151 lives in the external GD25LE255E QSPI flash
+ * (PM_EXTERNAL_FLASH_MCUBOOT_SECONDARY). Closing the file requests a TEST
+ * upgrade; writing dev/confirm makes the booted image permanent (else MCUboot
+ * reverts on the next reboot). The 5340 aggregator re-exports this node as
+ * /dev/fw9151 via union_fs. The image is a single merged ns image
+ * (TFM_MCUBOOT_IMAGE_NUMBER=1), matching ninep_dfu's single-slot model.
+ */
+static int dfu_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(buf); ARG_UNUSED(off); ARG_UNUSED(ctx);
+	LOG_INF("reboot requested via 9P");
+	k_sleep(K_MSEC(100)); /* let logs flush */
+	sys_reboot(SYS_REBOOT_COLD);
+	return count; /* unreached */
+}
+
+static int dfu_write_confirm(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(buf); ARG_UNUSED(off); ARG_UNUSED(ctx);
+	int ret = ninep_dfu_confirm();
+
+	if (ret == 0) {
+		LOG_INF("9151 image confirmed via 9P");
+	}
+	return ret < 0 ? ret : count;
+}
+
+static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
+{
+	ARG_UNUSED(bytes);
+	switch (state) {
+	case NINEP_DFU_ERASING:  LOG_INF("fw9151 DFU: erasing secondary slot (external flash)"); break;
+	case NINEP_DFU_COMPLETE: LOG_INF("fw9151 DFU: complete - reboot to apply"); break;
+	case NINEP_DFU_ERROR:    LOG_ERR("fw9151 DFU: error %d", err); break;
+	default: break;
+	}
+}
+
+static int register_dev(void)
+{
+	int ret;
+
+	ret = ninep_sysfs_register_dir(&sysfs, "dev");
+	if (ret < 0 && ret != -EEXIST) {
+		return ret;
+	}
+	(void)ninep_sysfs_register_writable_file(&sysfs, "dev/reboot",
+						 NULL, dfu_write_reboot, NULL);
+	(void)ninep_sysfs_register_writable_file(&sysfs, "dev/confirm",
+						 NULL, dfu_write_confirm, NULL);
+
+	struct ninep_dfu_config dfu_cfg = {
+		.path = "dev/firmware",
+		.status_cb = dfu_status,
+	};
+	ret = ninep_dfu_init(&dfu, &sysfs, &dfu_cfg);
+	if (ret < 0) {
+		LOG_ERR("fw9151 DFU init: %d", ret);
+		return ret;
+	}
+
+	if (!boot_is_img_confirmed()) {
+		LOG_WRN("9151 image not confirmed - write /dev/confirm or it reverts on reboot");
+	}
+	return 0;
+}
+
 static int register_tree(void)
 {
 	int ret;
@@ -299,6 +373,11 @@ int aether_9p_init(struct net_if *iface)
 	ret = register_tree();
 	if (ret < 0) {
 		LOG_ERR("/net/aether registration: %d", ret);
+		return ret;
+	}
+	ret = register_dev();
+	if (ret < 0) {
+		LOG_ERR("/dev/firmware registration: %d", ret);
 		return ret;
 	}
 	ret = ninep_transport_uart_init(&transport, &tc, NULL, NULL);
