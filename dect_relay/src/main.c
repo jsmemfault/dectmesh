@@ -205,7 +205,6 @@ static void fw_dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
  */
 static struct ninep_transport mesh_transport;
 static struct ninep_client mesh_client;
-static uint8_t mesh_client_rx[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 static const struct ninep_client_config mesh_client_cfg = {
 	.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 	.version = "9P2000",
@@ -214,6 +213,129 @@ static const struct ninep_client_config mesh_client_cfg = {
 static uint32_t mesh_root_fid;
 static bool mesh_attached;
 static struct k_mutex mesh_lock;  /* serialize proxy access to the one client */
+
+/*
+ * Custom RX transport for the client on uart1.
+ *
+ * transport_uart's polling mode (uart_poll_in) does NOT deliver RX on the nRF53
+ * uart1 (it works on the nRF91 server side, but not here), and its interrupt
+ * mode calls recv_cb from the ISR -- unsafe for the client, whose recv_cb
+ * (client_recv_callback) broadcasts a condvar (thread context only). So: drain
+ * the UART in the ISR (proven by the old byte-pump), accumulate a full 9P
+ * message, then hand it to the client's recv_cb on a work queue. While a message
+ * is in flight to the work queue we hold off new bytes (the client is strictly
+ * request/response, so nothing new arrives until the reply is consumed).
+ */
+static uint8_t mesh_rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];   /* ISR accumulator */
+static uint8_t mesh_rx_msg[CONFIG_NINEP_MAX_MESSAGE_SIZE];   /* handed to recv_cb */
+static size_t mesh_rx_len;
+static uint32_t mesh_rx_expected;
+static bool mesh_rx_have_hdr;
+static volatile bool mesh_rx_processing;
+static uint32_t mesh_rx_proc_len;
+static struct k_work mesh_rx_work;
+#define MESH_RX_WQ_STACK 2048
+static K_THREAD_STACK_DEFINE(mesh_rx_wq_stack, MESH_RX_WQ_STACK);
+static struct k_work_q mesh_rx_wq;
+
+static void mesh_rx_work_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	uint32_t len = mesh_rx_proc_len;
+
+	/* Copy the completed reply out, then free the ISR accumulator + clear
+	 * 'processing' BEFORE invoking recv_cb. recv_cb broadcasts the condvar,
+	 * which wakes the caller to send its NEXT request -- whose reply can land
+	 * immediately, so the ISR must already be able to accept it (otherwise it
+	 * gets dropped and the next op times out). recv_cb reads the copy, so the
+	 * ISR refilling mesh_rx_buf in parallel is safe. */
+	memcpy(mesh_rx_msg, mesh_rx_buf, len);
+	mesh_rx_len = 0;
+	mesh_rx_have_hdr = false;
+	mesh_rx_expected = 0;
+	mesh_rx_processing = false;
+
+	if (mesh_transport.recv_cb) {
+		mesh_transport.recv_cb(&mesh_transport, mesh_rx_msg, len,
+				       mesh_transport.user_data);
+	}
+}
+
+static void mesh_uart_isr(const struct device *dev, void *ud)
+{
+	ARG_UNUSED(ud);
+
+	if (!uart_irq_update(dev)) {
+		return;
+	}
+	while (uart_irq_rx_ready(dev)) {
+		uint8_t b[64];
+		int n = uart_fifo_read(dev, b, sizeof(b));
+
+		if (n <= 0) {
+			break;
+		}
+		if (mesh_rx_processing) {
+			continue;  /* reply still being handed up; drop (none expected) */
+		}
+		for (int i = 0; i < n; i++) {
+			if (mesh_rx_len >= sizeof(mesh_rx_buf)) {
+				mesh_rx_len = 0;
+				mesh_rx_have_hdr = false;
+			}
+			mesh_rx_buf[mesh_rx_len++] = b[i];
+
+			if (!mesh_rx_have_hdr && mesh_rx_len >= 7) {
+				mesh_rx_expected = mesh_rx_buf[0] |
+						   (mesh_rx_buf[1] << 8) |
+						   (mesh_rx_buf[2] << 16) |
+						   (mesh_rx_buf[3] << 24);
+				if (mesh_rx_expected < 7 ||
+				    mesh_rx_expected > sizeof(mesh_rx_buf)) {
+					mesh_rx_len = 0;  /* resync */
+					continue;
+				}
+				mesh_rx_have_hdr = true;
+			}
+			if (mesh_rx_have_hdr && mesh_rx_len >= mesh_rx_expected) {
+				mesh_rx_proc_len = mesh_rx_expected;
+				mesh_rx_processing = true;
+				k_work_submit_to_queue(&mesh_rx_wq, &mesh_rx_work);
+				break;
+			}
+		}
+	}
+}
+
+static int mesh_tx_send(struct ninep_transport *t, const uint8_t *buf, size_t len)
+{
+	ARG_UNUSED(t);
+	for (size_t i = 0; i < len; i++) {
+		uart_poll_out(ic_uart, buf[i]);
+	}
+	return (int)len;
+}
+
+static int mesh_tx_start(struct ninep_transport *t)
+{
+	ARG_UNUSED(t);
+	uart_irq_rx_disable(ic_uart);
+	uart_irq_callback_user_data_set(ic_uart, mesh_uart_isr, NULL);
+	uart_irq_rx_enable(ic_uart);
+	return 0;
+}
+
+static int mesh_tx_get_mtu(struct ninep_transport *t)
+{
+	ARG_UNUSED(t);
+	return CONFIG_NINEP_MAX_MESSAGE_SIZE;
+}
+
+static const struct ninep_transport_ops mesh_tx_ops = {
+	.send = mesh_tx_send,
+	.start = mesh_tx_start,
+	.get_mtu = mesh_tx_get_mtu,
+};
 
 /* Lazily negotiate version + attach to the 9151 root (it may boot later). */
 static int mesh_ensure_attached(void)
@@ -241,11 +363,6 @@ static int mesh_ensure_attached(void)
 
 static int mesh_client_init(void)
 {
-	struct ninep_transport_uart_config tc = {
-		.uart_dev = ic_uart,
-		.rx_buf = mesh_client_rx,
-		.rx_buf_size = sizeof(mesh_client_rx),
-	};
 	int ret;
 
 	k_mutex_init(&mesh_lock);
@@ -254,18 +371,23 @@ static int mesh_client_init(void)
 		LOG_ERR("inter-chip UART (9151 link) not ready");
 		return -ENODEV;
 	}
-	ret = ninep_transport_uart_init(&mesh_transport, &tc, NULL, NULL);
-	if (ret < 0) {
-		LOG_ERR("mesh client transport init: %d", ret);
-		return ret;
-	}
-	/* ninep_client_init sets the transport recv_cb and starts the transport. */
+
+	k_work_queue_start(&mesh_rx_wq, mesh_rx_wq_stack,
+			   K_THREAD_STACK_SIZEOF(mesh_rx_wq_stack),
+			   K_PRIO_PREEMPT(7), NULL);
+	k_work_init(&mesh_rx_work, mesh_rx_work_handler);
+
+	mesh_transport.ops = &mesh_tx_ops;
+	mesh_transport.priv_data = NULL;
+
+	/* ninep_client_init sets the transport recv_cb + user_data and calls
+	 * transport->ops->start (mesh_tx_start) to enable interrupt RX. */
 	ret = ninep_client_init(&mesh_client, &mesh_client_cfg, &mesh_transport);
 	if (ret < 0) {
 		LOG_ERR("mesh client init: %d", ret);
 		return ret;
 	}
-	LOG_INF("9P client up on uart1 -> 9151 (attach is lazy)");
+	LOG_INF("9P client up on uart1 -> 9151 (irq RX + workqueue; attach lazy)");
 	return 0;
 }
 
@@ -284,13 +406,16 @@ static int fw9151_open_remote(uint8_t mode, uint32_t *out_fid)
 	}
 	ret = ninep_client_walk(&mesh_client, mesh_root_fid, &fid, "dev/firmware");
 	if (ret < 0) {
+		LOG_WRN("fw9151: walk dev/firmware failed: %d", ret);
 		return ret;
 	}
 	ret = ninep_client_open(&mesh_client, fid, mode);
 	if (ret < 0) {
+		LOG_WRN("fw9151: open (mode 0x%02x) failed: %d", mode, ret);
 		ninep_client_clunk(&mesh_client, fid);
 		return ret;
 	}
+	LOG_INF("fw9151: remote dev/firmware open (mode 0x%02x, fid %u)", mode, fid);
 	*out_fid = fid;
 	return 0;
 }
@@ -309,6 +434,9 @@ static int fw9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
 		return ret;
 	}
 	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret < 0) {
+		LOG_WRN("fw9151: remote read failed: %d", ret);
+	}
 	ninep_client_clunk(&mesh_client, fid);
 	k_mutex_unlock(&mesh_lock);
 	return ret;
