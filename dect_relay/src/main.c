@@ -29,6 +29,9 @@
 #include <zephyr/9p/session_pool_uart.h>
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/dfu.h>
+#include <zephyr/9p/client.h>
+#include <zephyr/9p/transport_uart.h>
+#include <zephyr/9p/protocol.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(dect_relay, LOG_LEVEL_INF);
@@ -156,7 +159,7 @@ static void console_bridge_init(void)
 static const struct device *const fw_cdc = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart1));
 NINEP_SESSION_POOL_UART_DEFINE(fw_uart_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
 static struct ninep_sysfs fw_sysfs;
-static struct ninep_sysfs_entry fw_sysfs_entries[8];
+static struct ninep_sysfs_entry fw_sysfs_entries[12];
 static struct ninep_dfu fw_dfu;
 
 static int fw_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
@@ -190,6 +193,174 @@ static void fw_dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 	}
 }
 
+/* ---- 9P CLIENT to the nRF9151 over uart1 (the aggregator link) ----
+ *
+ * The 5340 is now a 9P CLIENT to the 9151's server (which exposes /net/aether
+ * and /dev/firmware over its uart0 <-> our uart1), replacing the old
+ * uart1<->L2CAP byte-pump. Because the 5340 now PARSES 9P, it can re-export
+ * selected 9151 nodes into its own served tree -- here the 9151's /dev/firmware
+ * is proxied as /dev/fw9151, so the same host `9p` tooling that flashes
+ * /dev/fw5340 can flash the 9151 too. The client transport is polling-mode
+ * (its recv callback broadcasts a condvar, which must run in thread context).
+ */
+static struct ninep_transport mesh_transport;
+static struct ninep_client mesh_client;
+static uint8_t mesh_client_rx[CONFIG_NINEP_MAX_MESSAGE_SIZE];
+static const struct ninep_client_config mesh_client_cfg = {
+	.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
+	.version = "9P2000",
+	.timeout_ms = 5000,
+};
+static uint32_t mesh_root_fid;
+static bool mesh_attached;
+static struct k_mutex mesh_lock;  /* serialize proxy access to the one client */
+
+/* Lazily negotiate version + attach to the 9151 root (it may boot later). */
+static int mesh_ensure_attached(void)
+{
+	int ret;
+
+	if (mesh_attached) {
+		return 0;
+	}
+	ret = ninep_client_version(&mesh_client);
+	if (ret < 0) {
+		LOG_WRN("9151 Tversion failed: %d", ret);
+		return ret;
+	}
+	ret = ninep_client_attach(&mesh_client, &mesh_root_fid, NINEP_NOFID,
+				  "relay", "");
+	if (ret < 0) {
+		LOG_WRN("9151 Tattach failed: %d", ret);
+		return ret;
+	}
+	mesh_attached = true;
+	LOG_INF("attached to 9151 9P server (root fid %u)", mesh_root_fid);
+	return 0;
+}
+
+static int mesh_client_init(void)
+{
+	struct ninep_transport_uart_config tc = {
+		.uart_dev = ic_uart,
+		.rx_buf = mesh_client_rx,
+		.rx_buf_size = sizeof(mesh_client_rx),
+	};
+	int ret;
+
+	k_mutex_init(&mesh_lock);
+
+	if (!device_is_ready(ic_uart)) {
+		LOG_ERR("inter-chip UART (9151 link) not ready");
+		return -ENODEV;
+	}
+	ret = ninep_transport_uart_init(&mesh_transport, &tc, NULL, NULL);
+	if (ret < 0) {
+		LOG_ERR("mesh client transport init: %d", ret);
+		return ret;
+	}
+	/* ninep_client_init sets the transport recv_cb and starts the transport. */
+	ret = ninep_client_init(&mesh_client, &mesh_client_cfg, &mesh_transport);
+	if (ret < 0) {
+		LOG_ERR("mesh client init: %d", ret);
+		return ret;
+	}
+	LOG_INF("9P client up on uart1 -> 9151 (attach is lazy)");
+	return 0;
+}
+
+/* /dev/fw9151 -- proxy of the 9151's /dev/firmware over the mesh client. */
+static uint32_t fw9151_wfid;     /* remote fid open for the current write stream */
+static bool fw9151_writing;
+static uint64_t fw9151_woff;
+
+static int fw9151_open_remote(uint8_t mode, uint32_t *out_fid)
+{
+	uint32_t fid;
+	int ret = mesh_ensure_attached();
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_walk(&mesh_client, mesh_root_fid, &fid, "dev/firmware");
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_open(&mesh_client, fid, mode);
+	if (ret < 0) {
+		ninep_client_clunk(&mesh_client, fid);
+		return ret;
+	}
+	*out_fid = fid;
+	return 0;
+}
+
+/* read: proxy the 9151 firmware status (open/read/clunk per call; status is tiny) */
+static int fw9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	uint32_t fid;
+	int ret;
+
+	k_mutex_lock(&mesh_lock, K_FOREVER);
+	ret = fw9151_open_remote(NINEP_OREAD, &fid);
+	if (ret < 0) {
+		k_mutex_unlock(&mesh_lock);
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	ninep_client_clunk(&mesh_client, fid);
+	k_mutex_unlock(&mesh_lock);
+	return ret;
+}
+
+/* write: stream a signed image to the 9151's secondary slot (one remote fid) */
+static int fw9151_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx); ARG_UNUSED(off);
+	int ret;
+
+	k_mutex_lock(&mesh_lock, K_FOREVER);
+	if (!fw9151_writing) {
+		ret = fw9151_open_remote(NINEP_OWRITE, &fw9151_wfid);
+		if (ret < 0) {
+			k_mutex_unlock(&mesh_lock);
+			return ret;
+		}
+		fw9151_writing = true;
+		fw9151_woff = 0;
+		LOG_INF("fw9151: DFU stream started");
+	}
+	ret = ninep_client_write(&mesh_client, fw9151_wfid, fw9151_woff, buf, count);
+	if (ret < 0) {
+		LOG_ERR("fw9151: remote write failed: %d", ret);
+		ninep_client_clunk(&mesh_client, fw9151_wfid);
+		fw9151_writing = false;
+		k_mutex_unlock(&mesh_lock);
+		return ret;
+	}
+	fw9151_woff += ret;
+	k_mutex_unlock(&mesh_lock);
+	return ret;
+}
+
+/* clunk: close the remote fid -> the 9151's ninep_dfu requests its upgrade */
+static int fw9151_clunk(void *ctx)
+{
+	ARG_UNUSED(ctx);
+	int ret = 0;
+
+	k_mutex_lock(&mesh_lock, K_FOREVER);
+	if (fw9151_writing) {
+		ret = ninep_client_clunk(&mesh_client, fw9151_wfid);
+		fw9151_writing = false;
+		LOG_INF("fw9151: DFU stream finalized (%llu bytes); 9151 will upgrade",
+			fw9151_woff);
+	}
+	k_mutex_unlock(&mesh_lock);
+	return ret;
+}
+
 static int fw_9p_init(void)
 {
 	int err;
@@ -208,6 +379,11 @@ static int fw_9p_init(void)
 						 NULL, fw_write_reboot, NULL);
 	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/confirm",
 						 NULL, fw_write_confirm, NULL);
+
+	/* dev/fw9151: the 9151's /dev/firmware, re-exported over the mesh client. */
+	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/fw9151",
+						    fw9151_read, fw9151_write,
+						    fw9151_clunk, NULL);
 
 	struct ninep_dfu_config dfu_cfg = {
 		.path = "dev/fw5340",
@@ -241,144 +417,16 @@ static int fw_9p_init(void)
 		LOG_WRN("5340 image not confirmed - write /dev/confirm or it reverts on reboot");
 	}
 	LOG_INF("fw 9P session pool up on cdc_acm_uart1 (DTR-gated): "
-		"/dev/fw5340, /dev/confirm, /dev/reboot");
+		"/dev/fw5340, /dev/fw9151, /dev/confirm, /dev/reboot");
 	return 0;
 }
 
-/* L2CAP TX SDU pool. */
-NET_BUF_POOL_DEFINE(relay_tx_pool, 4, BT_L2CAP_SDU_BUF_SIZE(RELAY_MTU),
-		    CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
-
-/* UART -> L2CAP staging. */
-RING_BUF_DECLARE(uart_rx_rb, UART_RING_SIZE);
-static K_SEM_DEFINE(uart_rx_sem, 0, 1);
-
-/* The single active relay channel. */
-struct relay_chan {
-	struct bt_l2cap_le_chan le;
-	bool connected;
-};
-static struct relay_chan relay_chan;
-static struct relay_chan *active_chan;
-
-/* ---- UART: ISR drains RX into the ring buffer, TX is polled ---- */
-
-static void uart_isr(const struct device *dev, void *user_data)
-{
-	ARG_UNUSED(user_data);
-	uint8_t buf[64];
-	int n;
-
-	while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
-		n = uart_fifo_read(dev, buf, sizeof(buf));
-		if (n <= 0) {
-			break;
-		}
-		(void)ring_buf_put(&uart_rx_rb, buf, n);
-		k_sem_give(&uart_rx_sem);
-	}
-}
-
-static void uart_write_all(const uint8_t *data, size_t len)
-{
-	for (size_t i = 0; i < len; i++) {
-		uart_poll_out(ic_uart, data[i]);
-	}
-}
-
-/* ---- L2CAP CoC server ---- */
-
-static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
-{
-	ARG_UNUSED(chan);
-	/* L2CAP SDU from the client -> forward verbatim to the 9151 over UART. */
-	uart_write_all(buf->data, buf->len);
-	return 0; /* NCS grants credits internally */
-}
-
-static void l2cap_connected(struct bt_l2cap_chan *chan)
-{
-	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
-	struct relay_chan *rc = CONTAINER_OF(le, struct relay_chan, le);
-
-	rc->connected = true;
-	active_chan = rc;
-	LOG_INF("L2CAP relay channel up (MTU rx=%u tx=%u)", le->rx.mtu, le->tx.mtu);
-}
-
-static void l2cap_disconnected(struct bt_l2cap_chan *chan)
-{
-	struct bt_l2cap_le_chan *le = BT_L2CAP_LE_CHAN(chan);
-	struct relay_chan *rc = CONTAINER_OF(le, struct relay_chan, le);
-
-	rc->connected = false;
-	if (active_chan == rc) {
-		active_chan = NULL;
-	}
-	LOG_INF("L2CAP relay channel down");
-}
-
-static const struct bt_l2cap_chan_ops chan_ops = {
-	.connected = l2cap_connected,
-	.disconnected = l2cap_disconnected,
-	.recv = l2cap_recv,
-};
-
-static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server,
-			struct bt_l2cap_chan **chan)
-{
-	ARG_UNUSED(conn);
-	ARG_UNUSED(server);
-
-	if (relay_chan.connected) {
-		return -ENOMEM; /* single client */
-	}
-	memset(&relay_chan, 0, sizeof(relay_chan));
-	relay_chan.le.chan.ops = &chan_ops;
-	relay_chan.le.rx.mtu = RELAY_MTU;
-	*chan = &relay_chan.le.chan;
-	return 0;
-}
-
-static struct bt_l2cap_server l2cap_server = {
-	.psm = RELAY_PSM,
-	.sec_level = BT_SECURITY_L1, /* link is open; auth is at the 9P/factotum layer */
-	.accept = l2cap_accept,
-};
-
-/* ---- UART -> L2CAP pump thread ---- */
-
-static void relay_thread(void *a, void *b, void *c)
-{
-	ARG_UNUSED(a);
-	ARG_UNUSED(b);
-	ARG_UNUSED(c);
-	uint8_t chunk[L2CAP_CHUNK_MAX];
-
-	while (1) {
-		k_sem_take(&uart_rx_sem, K_FOREVER);
-
-		uint32_t n;
-		while ((n = ring_buf_get(&uart_rx_rb, chunk, sizeof(chunk))) > 0) {
-			if (!active_chan || !active_chan->connected) {
-				continue; /* no client; drop (9P client will retry) */
-			}
-			struct net_buf *nb = net_buf_alloc(&relay_tx_pool, K_MSEC(100));
-			if (!nb) {
-				LOG_WRN("no TX buf, dropping %u bytes", n);
-				continue;
-			}
-			net_buf_reserve(nb, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
-			net_buf_add_mem(nb, chunk, n);
-			int ret = bt_l2cap_chan_send(&active_chan->le.chan, nb);
-			if (ret < 0) {
-				LOG_WRN("l2cap send failed: %d", ret);
-				net_buf_unref(nb);
-			}
-		}
-	}
-}
-K_THREAD_DEFINE(relay_tid, 2048, relay_thread, NULL, NULL, NULL, 5, 0, 0);
+/*
+ * The old uart1<->L2CAP byte-pump lived here. It's gone: uart1 is now owned by
+ * the 9P client (mesh_client) above, and host access is the re-export server on
+ * cdc_acm_uart1. A BLE L2CAP re-export (session_pool_l2cap on the same union)
+ * can be added back later; advertising stays up so the device is discoverable.
+ */
 
 /* ---- BLE bring-up ---- */
 
@@ -415,16 +463,15 @@ int main(void)
 {
 	int err;
 
-	LOG_INF("DECT mesh BLE relay (L2CAP PSM 0x%04x <-> uart1)", RELAY_PSM);
+	LOG_INF("DECT relay/aggregator: 9P client on uart1 -> 9151, re-export on USB");
 
-	if (!device_is_ready(ic_uart)) {
-		LOG_ERR("inter-chip UART not ready");
-		return 0;
+	/* uart1 is now the 9P client link to the 9151 (replaces the byte-pump). */
+	err = mesh_client_init();
+	if (err) {
+		LOG_ERR("mesh 9P client init failed: %d", err);
 	}
-	uart_irq_callback_user_data_set(ic_uart, uart_isr, NULL);
-	uart_irq_rx_enable(ic_uart);
 
-	/* Bring up USB + the nRF9151-console <-> CDC ACM bridge. */
+	/* Bring up USB + the nRF9151-console <-> CDC ACM bridge + re-export server. */
 	err = usb_enable(NULL);
 	if (err && err != -EALREADY) {
 		LOG_ERR("usb_enable failed: %d", err);
@@ -444,11 +491,6 @@ int main(void)
 		LOG_ERR("bt_enable failed: %d", err);
 		return 0;
 	}
-	err = bt_l2cap_server_register(&l2cap_server);
-	if (err) {
-		LOG_ERR("l2cap server register failed: %d", err);
-		return 0;
-	}
 	err = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
 					      BT_GAP_ADV_FAST_INT_MAX_2, NULL),
 			      ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
@@ -457,6 +499,7 @@ int main(void)
 		return 0;
 	}
 
-	LOG_INF("relay ready: advertising, L2CAP server on PSM 0x%04x", RELAY_PSM);
+	LOG_INF("relay/aggregator ready: advertising; re-export on cdc_acm_uart1 "
+		"(/dev/fw5340 local, /dev/fw9151 -> 9151)");
 	return 0;
 }
