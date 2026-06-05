@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 
 enum {
 	Tversion = 100, Rversion = 101, Tattach = 104, Rattach = 105,
@@ -156,16 +157,140 @@ static void do_clunk(uint32_t fid)
 	rpc(o);
 }
 
+/* ---- tag-aware primitives for the pipelined concurrency demo ---- */
+
+static int send_only(int len)
+{
+	p32(mbuf, len);
+	return write(fd, mbuf, len) == len ? 0 : -1;
+}
+
+static uint8_t stash[MSIZE];
+static uint16_t stash_tag;
+static int have_stash;
+
+/* read one reply into dst (dst[0]=type, dst[1..2]=tag); returns type or -1 */
+static int recv_one(uint8_t *dst, uint16_t *tag)
+{
+	uint8_t hdr[4];
+	if (readn(hdr, 4) < 0) return -1;
+	uint32_t sz = g32(hdr);
+	if (sz < 7 || sz > MSIZE) return -1;
+	if (readn(dst, sz - 4) < 0) return -1;
+	*tag = g16(dst + 1);
+	return dst[0];
+}
+
+/* wait for the reply bearing `want`, stashing one out-of-order reply */
+static int recv_tag(uint16_t want, uint8_t *dst)
+{
+	if (have_stash && stash_tag == want) {
+		memcpy(dst, stash, MSIZE);
+		have_stash = 0;
+		return dst[0];
+	}
+	for (;;) {
+		uint16_t t;
+		int ty = recv_one(dst, &t);
+		if (ty < 0) return -1;
+		if (t == want) return ty;
+		memcpy(stash, dst, MSIZE);
+		stash_tag = t;
+		have_stash = 1;
+	}
+}
+
+/* build helpers that take an explicit tag, returning the framed length */
+static int b_walk(uint16_t tag, uint32_t fid, uint32_t nf, const char *path)
+{
+	char tmp[128]; strncpy(tmp, path, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
+	const char *parts[16]; int np = 0;
+	for (char *p = strtok(tmp, "/"); p && np < 16; p = strtok(NULL, "/")) parts[np++] = p;
+	int o = 4; mbuf[o++] = Twalk; p16(mbuf + o, tag); o += 2;
+	p32(mbuf + o, fid); o += 4; p32(mbuf + o, nf); o += 4; p16(mbuf + o, np); o += 2;
+	for (int i = 0; i < np; i++) { int l = strlen(parts[i]); p16(mbuf + o, l); o += 2; memcpy(mbuf + o, parts[i], l); o += l; }
+	return o;
+}
+static int b_open(uint16_t tag, uint32_t fid, uint8_t mode)
+{ int o = 4; mbuf[o++] = Topen; p16(mbuf + o, tag); o += 2; p32(mbuf + o, fid); o += 4; mbuf[o++] = mode; return o; }
+static int b_read(uint16_t tag, uint32_t fid, uint32_t count)
+{ int o = 4; mbuf[o++] = Tread; p16(mbuf + o, tag); o += 2; p32(mbuf + o, fid); o += 4; p32(mbuf + o, 0); o += 4; p32(mbuf + o, 0); o += 4; p32(mbuf + o, count); o += 4; return o; }
+static int b_clunk(uint16_t tag, uint32_t fid)
+{ int o = 4; mbuf[o++] = Tclunk; p16(mbuf + o, tag); o += 2; p32(mbuf + o, fid); o += 4; return o; }
+
+static long now_ms(void)
+{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L; }
+
+/* Prove the server stays responsive while a data read blocks: open a
+ * conversation's data fid, fire a blocking Tread (no datagram will come), then
+ * WITHOUT waiting do a status read and show it returns in milliseconds -- only
+ * possible if the blocking read was dispatched off the processing thread. */
+static int demo_concurrent(void)
+{
+	uint8_t rb[256];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	printf("[ok] attached\n");
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	printf("[ok] conversation %d open; data fid ready\n", conv);
+
+	/* fire a BLOCKING read on data (tag 10) and DO NOT wait for it */
+	send_only(b_read(10, 2, 256));
+	printf("[ok] blocking Tread(data) in flight (no datagram will arrive)\n");
+
+	/* Brief gap: the server's single per-session RX buffer drops a request
+	 * that arrives while the previous one is still being dispatched. The data
+	 * Tread dispatches to a worker in microseconds; 100ms guarantees the
+	 * status request below is accepted. The data read stays blocked throughout
+	 * -- that's the whole point. */
+	usleep(100000);
+
+	/* now interleave a status read on the SAME connection, timed */
+	long t0 = now_ms();
+	send_only(b_walk(1, 0, 3, "net/aether/status")); recv_tag(1, rb);
+	send_only(b_open(1, 3, OREAD)); recv_tag(1, rb);
+	send_only(b_read(1, 3, sizeof(rb) - 1)); int ty = recv_tag(1, rb);
+	long dt = now_ms() - t0;
+	if (ty == Rread) {
+		uint32_t c = g32(rb + 3); rb[7 + (c > 200 ? 200 : c)] = 0;
+		printf("[ok] status read returned in %ld ms WHILE data read blocked: %.*s",
+		       dt, (int)c, (char *)rb + 7);
+	}
+	send_only(b_clunk(1, 3)); recv_tag(1, rb);
+	if (dt < 2000)
+		printf("[PASS] server stayed responsive (status in %ldms, not stalled behind the blocked read)\n", dt);
+	else
+		printf("[FAIL] status took %ldms -- looks stalled behind the blocked read\n", dt);
+
+	/* tear down: clunk ctl -> conversation frees -> the blocked data read gets EOF */
+	send_only(b_clunk(1, 1)); recv_tag(1, rb);          /* clunk ctl (tag 1) */
+	int dty = recv_tag(10, rb);                          /* now the deferred data reply */
+	if (dty == Rread) printf("[ok] blocked data read woke with %u bytes (EOF on hangup)\n", g32(rb + 3));
+	send_only(b_clunk(1, 2)); recv_tag(1, rb);
+	do_clunk(0);
+	printf("[done] concurrent-read demo complete\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	if (argc < 2) { fprintf(stderr, "usage: %s <unix-sock> [peer_addr]\n", argv[0]); return 2; }
+	if (argc < 2) { fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent]\n", argv[0]); return 2; }
+	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
 	const char *sock = argv[1];
-	const char *peer = argc > 2 ? argv[2] : NULL;
+	const char *arg2 = argc > 2 ? argv[2] : NULL;
+	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
+	const char *peer = concurrent ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	strncpy(a.sun_path, sock, sizeof(a.sun_path) - 1);
 	if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("connect"); return 1; }
+
+	if (concurrent) {
+		return demo_concurrent();
+	}
 
 	uint8_t buf[256];
 	if (do_version()) { fprintf(stderr, "version failed\n"); return 1; }
