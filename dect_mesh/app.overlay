@@ -13,5 +13,9 @@
 
 &uart1 {
 	status = "okay";
-	current-speed = <115200>;
+	/* Inter-chip 9P link to the nRF5340. Bumped 115200 -> 1 Mbps to lift the
+	 * funnel for /net/aether datagram traffic. MUST match the 5340 side; flash
+	 * both together (a mismatch breaks the link). Drop to 921600/460800 if the
+	 * short inter-chip traces show overruns under sustained OTA streaming. */
+	current-speed = <1000000>;
 };

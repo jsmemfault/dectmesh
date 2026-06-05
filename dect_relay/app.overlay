@@ -15,7 +15,9 @@
 /* 9151 9P transport (its uart1) -> BLE L2CAP. */
 &uart1 {
 	status = "okay";
-	current-speed = <115200>;
+	/* Inter-chip 9P link to the nRF9151. 1 Mbps -- MUST match the 9151 side
+	 * (dect_mesh app.overlay); flash both together or the link breaks. */
+	current-speed = <1000000>;
 };
 
 /* 9151 console/shell (its uart0) -> USB CDC ACM. */
