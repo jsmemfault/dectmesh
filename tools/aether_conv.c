@@ -137,16 +137,21 @@ static int do_read(uint32_t fid, uint64_t off, uint8_t *out, int cap)
 	return n;
 }
 
-static int do_write(uint32_t fid, const void *data, int len)
+static int do_pwrite(uint32_t fid, uint64_t off, const void *data, int len)
 {
 	int o = 4;
 	mbuf[o++] = Twrite; p16(mbuf + o, 1); o += 2;
 	p32(mbuf + o, fid); o += 4;
-	p32(mbuf + o, 0); o += 4; p32(mbuf + o, 0); o += 4;
+	p32(mbuf + o, off); o += 4; p32(mbuf + o, off >> 32); o += 4;
 	p32(mbuf + o, len); o += 4; memcpy(mbuf + o, data, len); o += len;
 	if (rpc(o) != Rwrite) return -1;
 	/* reply in mbuf: type[1] tag[2] count[4] -> count@3 */
 	return (int)g32(mbuf + 3);
+}
+
+static int do_write(uint32_t fid, const void *data, int len)
+{
+	return do_pwrite(fid, 0, data, len);
 }
 
 static void do_clunk(uint32_t fid)
@@ -236,16 +241,12 @@ static int demo_concurrent(void)
 	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
 	printf("[ok] conversation %d open; data fid ready\n", conv);
 
-	/* fire a BLOCKING read on data (tag 10) and DO NOT wait for it */
+	/* fire a BLOCKING read on data (tag 10) and DO NOT wait for it, then
+	 * immediately -- no client-side pacing -- pipeline a status read behind
+	 * it. The server's ring-buffered RX frames both without dropping (9P is
+	 * multiplexed; a client may have many requests outstanding). */
 	send_only(b_read(10, 2, 256));
 	printf("[ok] blocking Tread(data) in flight (no datagram will arrive)\n");
-
-	/* Brief gap: the server's single per-session RX buffer drops a request
-	 * that arrives while the previous one is still being dispatched. The data
-	 * Tread dispatches to a worker in microseconds; 100ms guarantees the
-	 * status request below is accepted. The data read stays blocked throughout
-	 * -- that's the whole point. */
-	usleep(100000);
 
 	/* now interleave a status read on the SAME connection, timed */
 	long t0 = now_ms();
@@ -274,20 +275,62 @@ static int demo_concurrent(void)
 	return 0;
 }
 
+/* Stream a file to a 9P path in small chunks. Each Twrite carries `chunk` data
+ * bytes (default 1024), so even a server whose RX ring is small (e.g. an old
+ * build before the ring was sized to msize) accepts it without overflow -- the
+ * resilient way to push a corrected firmware image (e.g. /dev/fw5340) when a
+ * full-size write would stall. */
+static int do_put(const char *path, const char *file, int chunk)
+{
+	if (chunk <= 0 || chunk > (int)sizeof(mbuf) - 64) chunk = 1024;
+	FILE *f = fopen(file, "rb");
+	if (!f) { perror("fopen"); return 1; }
+
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, path)) { fprintf(stderr, "walk %s failed\n", path); return 1; }
+	if (do_open(1, OWRITE)) { fprintf(stderr, "open %s (OWRITE) failed\n", path); return 1; }
+	printf("[ok] %s open for write; streaming %s in %d-byte chunks\n", path, file, chunk);
+
+	uint8_t *blk = malloc(chunk);
+	uint64_t off = 0;
+	size_t r;
+	long t0 = now_ms();
+	while ((r = fread(blk, 1, chunk, f)) > 0) {
+		int w = do_pwrite(1, off, blk, (int)r);
+		if (w < 0) { fprintf(stderr, "\nwrite failed at offset %llu\n", off); free(blk); fclose(f); return 1; }
+		off += w;
+		if ((off & 0x3fff) == 0 || (size_t)w < r) printf("\r  %llu bytes", off);
+	}
+	printf("\r[ok] streamed %llu bytes in %ld ms\n", off, now_ms() - t0);
+	free(blk); fclose(f);
+	do_clunk(1);
+	do_clunk(0);
+	printf("[done] wrote %s\n", path);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	if (argc < 2) { fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent]\n", argv[0]); return 2; }
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --put <path> <file> [chunk]]\n", argv[0]);
+		return 2;
+	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
 	const char *sock = argv[1];
 	const char *arg2 = argc > 2 ? argv[2] : NULL;
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
-	const char *peer = concurrent ? NULL : arg2;
+	int put = arg2 && strcmp(arg2, "--put") == 0;
+	const char *peer = (concurrent || put) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	strncpy(a.sun_path, sock, sizeof(a.sun_path) - 1);
 	if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("connect"); return 1; }
 
+	if (put) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --put <path> <file> [chunk]\n", argv[0]); return 2; }
+		return do_put(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 1024);
+	}
 	if (concurrent) {
 		return demo_concurrent();
 	}
