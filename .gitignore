@@ -16,3 +16,8 @@ dectfw/
 
 # Local editor / agent config
 .claude/
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~

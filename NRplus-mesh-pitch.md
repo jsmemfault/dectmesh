@@ -26,6 +26,12 @@ DECT NR+ **PHY API**:
 - **Stateless tree routing (HONR16):** addresses encode topology; forwarding is arithmetic, no route
   tables to converge. (Dean Hall's HeyMac scheme — I'm implementing his spec, with his involvement.)
 - **It works end-to-end:** continuous-RX link layer, party-line chat across all three nodes live.
+- **The whole mesh is a filesystem (9P):** live state, firmware, and control are all *files* — one
+  uniform, transport-agnostic interface (USB / BLE L2CAP / UART / across the mesh) with generic,
+  decades-old tooling, no per-feature protocol. Firmware **OTA of a radio that has no USB becomes a
+  file write** proxied transparently through a companion chip; fleet introspection is `cat`. It's a
+  small idea with outsized leverage — and it's exactly what keeps the cloud/observability story below
+  simple as the fleet grows.
 - **Cross-PHY portability — the key result:** this is a port of my proven **LoRa** mesh; the routing
   and MAC logic moved to DECT NR+ **essentially unchanged.** That's evidence the abstraction sits at
   the right layer — and it pre-fits the **sub-GHz NR+** part on the roadmap.
@@ -39,8 +45,10 @@ Code is a clean, MIT-licensed Zephyr module. 3-minute demo video: [link].
   story no partner is telling.
 - **My differentiator — fleet observability built in.** Coming from nRF Cloud, and with **Memfault
   now in-house**, I'd make every mesh node report health, connectivity, and topology to the cloud.
-  Mesh + first-class observability is squarely Nordic's post-acquisition strength and a real
-  differentiator vs. the partner stacks.
+  And because each node's entire state is **already a 9P filesystem**, that pipeline is *reading
+  files* — not bolting on a new protocol per metric, per transport, or per firmware step. Mesh +
+  first-class observability is squarely Nordic's post-acquisition strength and a real differentiator
+  vs. the partner stacks.
 
 ## Honest scope (so this complements, not competes)
 This is a **reference / research / maker enabler** that grows the top of the adoption funnel — it is

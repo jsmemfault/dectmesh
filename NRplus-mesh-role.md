@@ -14,7 +14,9 @@ exactly the half-maintained repos developers learn not to trust. The payoff — 
 wins — only materializes if someone owns it end to end.
 
 ## Mandate 1 — Technical lead (own the stack)
-- Architecture, roadmap, and code for the open mesh stack: routing, self-organization, link layer.
+- Architecture, roadmap, and code for the open mesh stack: routing, self-organization, link layer,
+  and the uniform **9P filesystem control plane** that makes state, firmware, and telemetry one
+  interface across transports.
 - Upstream it as first-class **Zephyr modules** and keep it building in NCS.
 - Drive the roadmap that turns the demo into something real: **link-layer security**, reliability,
   **cloud/fleet telemetry** (nRF Cloud / Memfault), and the **sub-GHz NR+** target.

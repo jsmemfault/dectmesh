@@ -41,3 +41,20 @@ one-take and unedited where you can — the credibility *is* that it's real.
 - **60 s:** drop beat 3 (chat) and go straight from "it self-organized" to "watch it heal."
 - **15 s teaser (for chat/Slack/social):** beats 4→5 only — kill the root, show the heal, end card.
   This is the clip that travels.
+
+---
+
+## Companion clip — "the mesh is a filesystem" (~30 s, separate asset)
+
+A second, standalone clip for the developer audience — *don't* bolt it onto the self-heal video; the
+self-heal sells "it's real," this sells "and it's a joy to work with." One terminal, host-side.
+
+| # | On screen / action | Voiceover |
+|---|--------------------|-----------|
+| 1 | `9p ls /dev` over USB → the node tree (`fw9151`, `link9151`, `reboot9151`, …). | "The whole node is a filesystem. Live state, firmware, control — files." |
+| 2 | `9p read /dev/link9151` and `9p read /dev/fw9151` → human-readable status. | "Health and version: just read them. No SDK, no custom app." |
+| 3 | `9p write /dev/fw9151 < image` then `9p write /dev/reboot9151`; the log shows the relay **auto-confirm** the new version. | "Firmware update on a radio that has *no USB* — a file write, proxied through its companion chip. It boots, verifies, and confirms itself." |
+| 4 | (optional) the *same* `9p ls /dev` from the cyberdeck over **BLE L2CAP**. End card. | "Same filesystem, different transport — USB or Bluetooth, no code changes. That's 9P." |
+
+**Why it lands:** every beat is a generic, decades-old command doing something a microcontroller radio
+mesh has no business making this easy. No narration hype — the `ls`/`read`/`write` *is* the argument.
