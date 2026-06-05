@@ -30,6 +30,8 @@
 #include <zephyr/9p/session_pool_uart.h>
 #include <zephyr/9p/session_pool_l2cap.h>
 #include <zephyr/9p/sysfs.h>
+#include <zephyr/9p/union_fs.h>
+#include <zephyr/9p/remote_fs.h>
 #include <zephyr/9p/dfu.h>
 #include <zephyr/9p/client.h>
 #include <zephyr/9p/transport_uart.h>
@@ -219,6 +221,23 @@ NINEP_SESSION_POOL_L2CAP_DEFINE(fw_l2cap_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE)
 static struct ninep_sysfs fw_sysfs;
 static struct ninep_sysfs_entry fw_sysfs_entries[32];
 static struct ninep_dfu fw_dfu;
+
+/*
+ * The served namespace is composed with union_fs (like the 9151's):
+ *   "/"           -> fw_sysfs   (the local /dev tree: fw5340, fw9151, link9151, ...)
+ *   "/net/aether" -> remote_fs  (the 9151's dynamic datagram tree, proxied live
+ *                                over the mesh client -- clone/ctl/data
+ *                                conversations, per doc/NET_AETHER_SPEC.md)
+ * Both session pools (USB-CDC + L2CAP) serve this union, so /net/aether reaches
+ * host and BLE 9P clients alike.
+ */
+static struct ninep_union_fs fw_union;
+static struct ninep_union_mount fw_union_mounts[2];
+static struct ninep_remote_fs aether_rfs;
+/* One node per concurrently-walked fid under /net/aether. The 9151 caps at
+ * AETHER_MAX_CONNS conversations; each uses a handful of fids (clone/ctl/data/
+ * dir/status) plus dir-listing walks -- 24 covers all four with headroom. */
+static struct ninep_remote_node aether_rnodes[24];
 
 static int fw_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
 {
@@ -523,6 +542,26 @@ static int mesh_ensure_attached(uint32_t *root)
 	LOG_INF("attached to 9151 9P server (root fid %u)", mesh_root_fid);
 	k_mutex_unlock(&mesh_sess);
 	return 0;
+}
+
+/*
+ * remote_fs hooks for the /net/aether re-export. root_fn hands the proxy the
+ * live 9151 root fid (re-attaching lazily); down_fn drops the session when a
+ * proxied walk finds the base fid stale (e.g. the 9151 rebooted), so the next
+ * root_fn re-versions+attaches -- the same self-heal the OTA proxy ops use.
+ */
+static int mesh_remote_root(uint32_t *root, void *user)
+{
+	ARG_UNUSED(user);
+	return mesh_ensure_attached(root);
+}
+
+static void mesh_remote_down(void *user)
+{
+	ARG_UNUSED(user);
+	k_mutex_lock(&mesh_sess, K_FOREVER);
+	mesh_attached = false;
+	k_mutex_unlock(&mesh_sess);
 }
 
 /*
@@ -927,37 +966,12 @@ static int fw9151auto_write(const uint8_t *buf, uint32_t count, uint64_t off, vo
 }
 
 /*
- * Re-export of the 9151's /net/aether mesh tree. Each node forwards a live
- * read (and chat a write) to the SAME path on the 9151 over the mesh link --
- * the host path and the remote path are identical, so the node's ctx IS the
- * remote path. Spec note: the 9151's current /net/aether was developed apart
- * from the cyberdeck's canonical tree and will be realigned; only this
- * registration list changes when it does -- the forwarding below is generic.
+ * The 9151's /net/aether is no longer re-exported as a curated, per-file sysfs
+ * proxy. It is now a *dynamic* datagram tree (clone/ctl/data conversations, per
+ * doc/NET_AETHER_SPEC.md) carried transparently by remote_fs union-mounted at
+ * "/net/aether" -- see fw_9p_init(). Node-state files (addr/rank/tree/...) moved
+ * to the 9151's /dev/aether per the spec.
  */
-static int aether_proxy_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
-{
-	const char *path = ctx;
-	uint32_t fid;
-	int ret = fw9151_open_remote(path, NINEP_OREAD, &fid);  /* no coarse lock */
-
-	if (ret < 0) {
-		return ret;
-	}
-	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
-	if (ret >= 0) {
-		mesh_note_contact();
-	}
-	(void)ninep_client_clunk(&mesh_client, fid);
-	return ret;
-}
-
-static int aether_proxy_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
-{
-	ARG_UNUSED(off);
-	int ret = fw9151_ctl_write((const char *)ctx, buf, count, false);
-
-	return ret < 0 ? ret : (int)count;
-}
 
 static int fw_9p_init(void)
 {
@@ -999,29 +1013,6 @@ static int fw_9p_init(void)
 						    fw9151auto_read, fw9151auto_write,
 						    NULL, NULL);
 
-	/* Re-export the 9151's /net/aether mesh tree, proxied live over the link.
-	 * (Curated list -- mirrors the 9151's current aether_9p.c; realign to the
-	 * cyberdeck spec by editing this list + the 9151 side.) */
-	(void)ninep_sysfs_register_dir(&fw_sysfs, "net");
-	(void)ninep_sysfs_register_dir(&fw_sysfs, "net/aether");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/addr",
-					aether_proxy_read, "net/aether/addr");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/rank",
-					aether_proxy_read, "net/aether/rank");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/parent",
-					aether_proxy_read, "net/aether/parent");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/nodeid",
-					aether_proxy_read, "net/aether/nodeid");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/tree",
-					aether_proxy_read, "net/aether/tree");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/neighbors",
-					aether_proxy_read, "net/aether/neighbors");
-	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/routes",
-					aether_proxy_read, "net/aether/routes");
-	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "net/aether/chat",
-						    aether_proxy_read, aether_proxy_write,
-						    NULL, "net/aether/chat");
-
 	struct ninep_dfu_config dfu_cfg = {
 		.path = "dev/fw5340",
 		.status_cb = fw_dfu_status,
@@ -1032,12 +1023,44 @@ static int fw_9p_init(void)
 		return err;
 	}
 
+	/*
+	 * Compose the served namespace: fw_sysfs at "/" (the local /dev tree) +
+	 * the 9151's /net/aether datagram tree, proxied live over the mesh client
+	 * by remote_fs, mounted at "/net/aether". The proxy keeps a persistent
+	 * 1:1 host-fid<->9151-fid mapping so clone/ctl/data conversations carry
+	 * through transparently (clone allocates a conversation upstream on walk).
+	 */
+	err = ninep_remote_fs_init(&aether_rfs, &mesh_client, "net/aether",
+				   aether_rnodes, ARRAY_SIZE(aether_rnodes),
+				   mesh_remote_root, mesh_remote_down, NULL);
+	if (err) {
+		LOG_ERR("/net/aether remote_fs init: %d", err);
+		return err;
+	}
+	err = ninep_union_fs_init(&fw_union, fw_union_mounts,
+				  ARRAY_SIZE(fw_union_mounts));
+	if (err) {
+		LOG_ERR("union_fs init: %d", err);
+		return err;
+	}
+	err = ninep_union_fs_mount(&fw_union, "/", ninep_sysfs_get_ops(), &fw_sysfs);
+	if (err) {
+		LOG_ERR("union mount /: %d", err);
+		return err;
+	}
+	err = ninep_union_fs_mount(&fw_union, "/net/aether",
+				   ninep_remote_fs_get_ops(), &aether_rfs);
+	if (err) {
+		LOG_ERR("union mount /net/aether: %d", err);
+		return err;
+	}
+
 	struct ninep_session_pool_uart_config pool_cfg = {
 		.uart_dev = fw_cdc,
 		.max_sessions = 1,
 		.rx_buf_size_per_session = CONFIG_NINEP_MAX_MESSAGE_SIZE,
-		.fs_ops = ninep_sysfs_get_ops(),
-		.fs_context = &fw_sysfs,
+		.fs_ops = ninep_union_fs_get_ops(),
+		.fs_context = &fw_union,
 	};
 	err = ninep_session_pool_uart_init(&fw_uart_pool, &pool_cfg);
 	if (err) {
@@ -1162,8 +1185,8 @@ int main(void)
 		.psm = RELAY_PSM,
 		.max_sessions = 1,
 		.rx_buf_size_per_session = CONFIG_NINEP_MAX_MESSAGE_SIZE,
-		.fs_ops = ninep_sysfs_get_ops(),
-		.fs_context = &fw_sysfs,
+		.fs_ops = ninep_union_fs_get_ops(),
+		.fs_context = &fw_union,
 	};
 	err = ninep_session_pool_l2cap_init(&fw_l2cap_pool, &l2cap_cfg);
 	if (err) {
