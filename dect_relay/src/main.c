@@ -217,7 +217,7 @@ NINEP_SESSION_POOL_UART_DEFINE(fw_uart_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
  * literal: USB and BLE expose one filesystem with no per-transport logic. */
 NINEP_SESSION_POOL_L2CAP_DEFINE(fw_l2cap_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
 static struct ninep_sysfs fw_sysfs;
-static struct ninep_sysfs_entry fw_sysfs_entries[16];
+static struct ninep_sysfs_entry fw_sysfs_entries[32];
 static struct ninep_dfu fw_dfu;
 
 static int fw_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
@@ -274,7 +274,19 @@ static const struct ninep_client_config mesh_client_cfg = {
 };
 static uint32_t mesh_root_fid;
 static bool mesh_attached;
-static struct k_mutex mesh_lock;  /* serialize proxy access to the one client */
+/*
+ * Two fine-grained locks instead of one coarse client lock (the 9p4z client is
+ * now per-tag concurrency-safe, so it doesn't need external serialization):
+ *  - mesh_sess: guards mesh_attached + mesh_root_fid. Held only BRIEFLY (snapshot
+ *    the root / (re)attach), NOT during the client walk/open/read/write -- so a
+ *    blocking /net/aether read holds no lock and can't freeze other ops.
+ *  - mesh_wr:   serializes the single OTA write stream (fw9151_writing/wfid/woff)
+ *    + the auto-confirm armed/staged state.
+ * Lock order when both are held: mesh_wr -> mesh_sess (only fw9151_write nests
+ * them, via fw9151_open_remote). Nothing takes mesh_sess then mesh_wr.
+ */
+static struct k_mutex mesh_sess;
+static struct k_mutex mesh_wr;
 
 /* --- 9151 link health, exposed read-only via dev/link9151 --- */
 static volatile uint32_t mesh_last_contact_ms; /* uptime of last successful handshake/op */
@@ -460,12 +472,23 @@ static void mesh_rx_reset(void)
 	irq_unlock(key);
 }
 
-/* Lazily negotiate version + attach to the 9151 root (it may boot later). */
-static int mesh_ensure_attached(void)
+/*
+ * Lazily negotiate version + attach to the 9151 root (it may boot later). Takes
+ * mesh_sess (brief on a live link -- just snapshots the root; only does the
+ * Tversion/Tattach when down, which serializes concurrent re-attaches). On
+ * success *root receives the current root fid so the caller walks from a
+ * consistent value without holding mesh_sess across the walk.
+ */
+static int mesh_ensure_attached(uint32_t *root)
 {
 	int ret;
 
+	k_mutex_lock(&mesh_sess, K_FOREVER);
 	if (mesh_attached) {
+		if (root) {
+			*root = mesh_root_fid;
+		}
+		k_mutex_unlock(&mesh_sess);
 		return 0;
 	}
 	mesh_rx_reset();  /* clear any boot/reboot garbage before handshaking */
@@ -481,18 +504,24 @@ static int mesh_ensure_attached(void)
 		ret, took, mesh_rx_isr_calls - c0, mesh_rx_isr_bytes - b0, arrive);
 	if (ret < 0) {
 		LOG_WRN("9151 Tversion failed: %d", ret);
+		k_mutex_unlock(&mesh_sess);
 		return ret;
 	}
 	ret = ninep_client_attach(&mesh_client, &mesh_root_fid, NINEP_NOFID,
 				  "relay", "");
 	if (ret < 0) {
 		LOG_WRN("9151 Tattach failed: %d", ret);
+		k_mutex_unlock(&mesh_sess);
 		return ret;
 	}
 	mesh_attached = true;
 	mesh_relink_attempts = 0;
 	mesh_note_contact();
+	if (root) {
+		*root = mesh_root_fid;
+	}
 	LOG_INF("attached to 9151 9P server (root fid %u)", mesh_root_fid);
+	k_mutex_unlock(&mesh_sess);
 	return 0;
 }
 
@@ -516,10 +545,11 @@ static void mesh_link_monitor_fn(void *a, void *b, void *c)
 	for (;;) {
 		bool up, came_up = false;
 
-		k_mutex_lock(&mesh_lock, K_FOREVER);
+		k_mutex_lock(&mesh_sess, K_FOREVER);
 		up = mesh_attached;
+		k_mutex_unlock(&mesh_sess);
 		if (!up) {
-			if (mesh_ensure_attached() == 0) {
+			if (mesh_ensure_attached(NULL) == 0) {
 				mesh_relink_total++;
 				up = true;
 				came_up = true;
@@ -528,17 +558,16 @@ static void mesh_link_monitor_fn(void *a, void *b, void *c)
 				mesh_relink_attempts++;
 			}
 		}
-		k_mutex_unlock(&mesh_lock);
 
 		/* On a fresh (re)link after an OTA stage -- e.g. the post-swap reboot --
-		 * verify the running image and auto-confirm it. Done OUTSIDE mesh_lock
-		 * (the proxy read/confirm re-take it themselves). */
+		 * verify the running image and auto-confirm it. The proxy read/confirm
+		 * take their own brief locks; the monitor holds none here. */
 		if (came_up && fw9151_autoconfirm && fw9151_armed) {
 			fw9151_auto_confirm_check();
 		}
 
 		/* Probe briskly while down, idle while up. The status read never
-		 * takes mesh_lock, so it stays instant even mid-probe. */
+		 * takes a mesh lock, so it stays instant even mid-probe. */
 		k_msleep(up ? 4000 : 1500);
 	}
 }
@@ -583,7 +612,8 @@ static int mesh_client_init(void)
 {
 	int ret;
 
-	k_mutex_init(&mesh_lock);
+	k_mutex_init(&mesh_sess);
+	k_mutex_init(&mesh_wr);
 
 	if (!device_is_ready(ic_uart)) {
 		LOG_ERR("inter-chip UART (9151 link) not ready");
@@ -635,14 +665,18 @@ static int fw9151_open_remote(const char *path, uint8_t mode, uint32_t *out_fid)
 	 * (fresh Tversion+Tattach), then retry the walk once.
 	 */
 	for (int attempt = 0; attempt < 2; attempt++) {
-		ret = mesh_ensure_attached();
+		uint32_t root;
+
+		ret = mesh_ensure_attached(&root);   /* brief mesh_sess; snapshots root */
 		if (ret < 0) {
 			return ret;
 		}
 		uint32_t wc0 = mesh_rx_isr_calls, wb0 = mesh_rx_isr_bytes;
 
 		mesh_rx_dbg_len = 0;  /* capture the walk's RX bytes */
-		ret = ninep_client_walk(&mesh_client, mesh_root_fid, &fid, path);
+		/* walk/open run WITHOUT a coarse lock -- the client is per-tag safe,
+		 * so concurrent proxy ops interleave and a blocking read holds nothing. */
+		ret = ninep_client_walk(&mesh_client, root, &fid, path);
 		LOG_DBG("post-Twalk %s ret=%d; uart1 RX during: isr_calls=%u isr_bytes=%u",
 			path, ret, mesh_rx_isr_calls - wc0, mesh_rx_isr_bytes - wb0);
 		uint32_t dl = mesh_rx_dbg_len;
@@ -655,7 +689,11 @@ static int fw9151_open_remote(const char *path, uint8_t mode, uint32_t *out_fid)
 			LOG_WRN("fw9151: walk %s failed: %d%s", path, ret,
 				attempt == 0 ? " -- stale session, re-attaching"
 					     : "");
+			/* stale root / link down -> drop the session so the next
+			 * mesh_ensure_attached re-versions+attaches. */
+			k_mutex_lock(&mesh_sess, K_FOREVER);
 			mesh_attached = false;
+			k_mutex_unlock(&mesh_sess);
 			continue;
 		}
 		ret = ninep_client_open(&mesh_client, fid, mode);
@@ -677,12 +715,9 @@ static int fw9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
 {
 	ARG_UNUSED(ctx);
 	uint32_t fid;
-	int ret;
+	int ret = fw9151_open_remote("dev/firmware", NINEP_OREAD, &fid);
 
-	k_mutex_lock(&mesh_lock, K_FOREVER);
-	ret = fw9151_open_remote("dev/firmware", NINEP_OREAD, &fid);
 	if (ret < 0) {
-		k_mutex_unlock(&mesh_lock);
 		return ret;
 	}
 	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
@@ -692,7 +727,6 @@ static int fw9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
 		mesh_note_contact();
 	}
 	ninep_client_clunk(&mesh_client, fid);
-	k_mutex_unlock(&mesh_lock);
 	return ret;
 }
 
@@ -702,11 +736,11 @@ static int fw9151_write(const uint8_t *buf, uint32_t count, uint64_t off, void *
 	ARG_UNUSED(ctx); ARG_UNUSED(off);
 	int ret;
 
-	k_mutex_lock(&mesh_lock, K_FOREVER);
+	k_mutex_lock(&mesh_wr, K_FOREVER);
 	if (!fw9151_writing) {
 		ret = fw9151_open_remote("dev/firmware", NINEP_OWRITE, &fw9151_wfid);
 		if (ret < 0) {
-			k_mutex_unlock(&mesh_lock);
+			k_mutex_unlock(&mesh_wr);
 			return ret;
 		}
 		fw9151_writing = true;
@@ -731,11 +765,11 @@ static int fw9151_write(const uint8_t *buf, uint32_t count, uint64_t off, void *
 		LOG_ERR("fw9151: remote write failed: %d", ret);
 		ninep_client_clunk(&mesh_client, fw9151_wfid);
 		fw9151_writing = false;
-		k_mutex_unlock(&mesh_lock);
+		k_mutex_unlock(&mesh_wr);
 		return ret;
 	}
 	fw9151_woff += ret;
-	k_mutex_unlock(&mesh_lock);
+	k_mutex_unlock(&mesh_wr);
 	return ret;
 }
 
@@ -745,7 +779,7 @@ static int fw9151_clunk(void *ctx)
 	ARG_UNUSED(ctx);
 	int ret = 0;
 
-	k_mutex_lock(&mesh_lock, K_FOREVER);
+	k_mutex_lock(&mesh_wr, K_FOREVER);
 	if (fw9151_writing) {
 		ret = ninep_client_clunk(&mesh_client, fw9151_wfid);
 		fw9151_writing = false;
@@ -753,7 +787,7 @@ static int fw9151_clunk(void *ctx)
 		LOG_INF("fw9151: DFU stream finalized (%llu bytes); 9151 will upgrade%s",
 			fw9151_woff, fw9151_armed ? " (auto-confirm armed)" : "");
 	}
-	k_mutex_unlock(&mesh_lock);
+	k_mutex_unlock(&mesh_wr);
 	return ret;
 }
 
@@ -768,24 +802,22 @@ static int fw9151_ctl_write(const char *path, const uint8_t *data, size_t len,
 			    bool expect_reset)
 {
 	uint32_t fid;
-	int ret;
+	int ret = fw9151_open_remote(path, NINEP_OWRITE, &fid);  /* brief mesh_sess */
 
-	k_mutex_lock(&mesh_lock, K_FOREVER);
-	ret = fw9151_open_remote(path, NINEP_OWRITE, &fid);
 	if (ret < 0) {
-		k_mutex_unlock(&mesh_lock);
 		return ret;
 	}
 	ret = ninep_client_write(&mesh_client, fid, 0, data, len);
 	(void)ninep_client_clunk(&mesh_client, fid);
 	if (expect_reset) {
 		/* The node reboots out from under us; drop the stale session. */
+		k_mutex_lock(&mesh_sess, K_FOREVER);
 		mesh_attached = false;
+		k_mutex_unlock(&mesh_sess);
 		if (ret < 0) {
 			ret = (int)len;  /* request delivered; reset ate the reply */
 		}
 	}
-	k_mutex_unlock(&mesh_lock);
 	return ret;
 }
 
@@ -894,6 +926,39 @@ static int fw9151auto_write(const uint8_t *buf, uint32_t count, uint64_t off, vo
 	return (int)count;
 }
 
+/*
+ * Re-export of the 9151's /net/aether mesh tree. Each node forwards a live
+ * read (and chat a write) to the SAME path on the 9151 over the mesh link --
+ * the host path and the remote path are identical, so the node's ctx IS the
+ * remote path. Spec note: the 9151's current /net/aether was developed apart
+ * from the cyberdeck's canonical tree and will be realigned; only this
+ * registration list changes when it does -- the forwarding below is generic.
+ */
+static int aether_proxy_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	const char *path = ctx;
+	uint32_t fid;
+	int ret = fw9151_open_remote(path, NINEP_OREAD, &fid);  /* no coarse lock */
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret;
+}
+
+static int aether_proxy_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(off);
+	int ret = fw9151_ctl_write((const char *)ctx, buf, count, false);
+
+	return ret < 0 ? ret : (int)count;
+}
+
 static int fw_9p_init(void)
 {
 	int err;
@@ -933,6 +998,29 @@ static int fw_9p_init(void)
 	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/fw9151auto",
 						    fw9151auto_read, fw9151auto_write,
 						    NULL, NULL);
+
+	/* Re-export the 9151's /net/aether mesh tree, proxied live over the link.
+	 * (Curated list -- mirrors the 9151's current aether_9p.c; realign to the
+	 * cyberdeck spec by editing this list + the 9151 side.) */
+	(void)ninep_sysfs_register_dir(&fw_sysfs, "net");
+	(void)ninep_sysfs_register_dir(&fw_sysfs, "net/aether");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/addr",
+					aether_proxy_read, "net/aether/addr");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/rank",
+					aether_proxy_read, "net/aether/rank");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/parent",
+					aether_proxy_read, "net/aether/parent");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/nodeid",
+					aether_proxy_read, "net/aether/nodeid");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/tree",
+					aether_proxy_read, "net/aether/tree");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/neighbors",
+					aether_proxy_read, "net/aether/neighbors");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "net/aether/routes",
+					aether_proxy_read, "net/aether/routes");
+	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "net/aether/chat",
+						    aether_proxy_read, aether_proxy_write,
+						    NULL, "net/aether/chat");
 
 	struct ninep_dfu_config dfu_cfg = {
 		.path = "dev/fw5340",
