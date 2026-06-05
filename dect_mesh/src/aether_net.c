@@ -511,6 +511,15 @@ static int anet_clunk(struct ninep_fs_node *node, void *ctx)
 	return 0;
 }
 
+/* Only the per-conversation data file blocks (it waits for a datagram); every
+ * other node returns promptly. Lets the server dispatch data reads to a worker
+ * so one blocked reader doesn't freeze the whole 9P server. */
+static int anet_read_will_block(struct ninep_fs_node *node, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	return AN(node)->kind == K_DATA ? 1 : 0;
+}
+
 static const struct ninep_fs_ops aether_net_ops = {
 	.get_root = anet_get_root,
 	.walk = anet_walk,
@@ -519,6 +528,7 @@ static const struct ninep_fs_ops aether_net_ops = {
 	.write = anet_write,
 	.stat = anet_stat,
 	.clunk = anet_clunk,
+	.read_will_block = anet_read_will_block,
 };
 
 const struct ninep_fs_ops *aether_net_get_ops(void) { return &aether_net_ops; }
