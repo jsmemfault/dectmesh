@@ -33,6 +33,7 @@ LOG_MODULE_REGISTER(aether_net, LOG_LEVEL_INF);
 #define AETHER_MAX_CONNS   4
 #define AETHER_MAX_MSG     512
 #define AETHER_RXQ_DEPTH   4
+#define AETHER_NET_RETRIES 3     /* reliable-send retry budget (DECT PHY also helps) */
 
 /* One received datagram queued for a conversation's data reader. */
 struct aether_dgram {
@@ -471,7 +472,8 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 		if (count > AETHER_MAX_MSG) {
 			return -EMSGSIZE;
 		}
-		int ret = aether_mesh_send_reliable(g_fs.iface, c->peer, buf, count);
+		int ret = aether_mesh_send_reliable(g_fs.iface, c->peer, buf, count,
+						    AETHER_NET_RETRIES);
 
 		return ret < 0 ? ret : (int)count;
 	}

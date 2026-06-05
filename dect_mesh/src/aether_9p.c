@@ -21,6 +21,8 @@
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/transport_uart.h>
 #include <zephyr/9p/dfu.h>
+#include <zephyr/9p/union_fs.h>
+#include "aether_net.h"
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/sys/reboot.h>
 #include <string.h>
@@ -38,6 +40,12 @@ static struct ninep_transport transport;
 static struct ninep_server server;
 static struct ninep_sysfs sysfs;
 static struct ninep_sysfs_entry sysfs_entries[24];
+
+/* union_fs composes the namespace: sysfs at "/" (the /dev tree, incl. the
+ * re-homed /dev/aether node-state files) + the aether_net datagram fs at
+ * "/net/aether". The server serves the union. */
+static struct ninep_union_fs aether_union;
+static struct ninep_union_mount aether_union_mounts[2];
 static struct ninep_dfu dfu;
 static uint8_t rx_buf[CONFIG_NINEP_MAX_MESSAGE_SIZE];
 static struct net_if *g_iface;
@@ -318,26 +326,27 @@ static int register_dev(void)
 	return 0;
 }
 
-static int register_tree(void)
+/*
+ * Node-state files under /dev/aether (spec §10: node state -- addr/rank/tree/
+ * neighbors/routes/chat -- is distinct from the /net/aether *network* datagram
+ * interface, which is served by aether_net.c and union-mounted at /net/aether).
+ * Requires "dev" to exist (register_dev runs first).
+ */
+static int register_dev_aether(void)
 {
-	int ret;
+	int ret = ninep_sysfs_register_dir(&sysfs, "dev/aether");
 
-	ret = ninep_sysfs_register_dir(&sysfs, "net");
 	if (ret < 0 && ret != -EEXIST) {
 		return ret;
 	}
-	ret = ninep_sysfs_register_dir(&sysfs, "net/aether");
-	if (ret < 0) {
-		return ret;
-	}
-	ninep_sysfs_register_file(&sysfs, "net/aether/addr", gen_addr, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/rank", gen_rank, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/parent", gen_parent, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/nodeid", gen_nodeid, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/tree", gen_tree, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/neighbors", gen_neighbors, NULL);
-	ninep_sysfs_register_file(&sysfs, "net/aether/routes", gen_routes, NULL);
-	ninep_sysfs_register_writable_file(&sysfs, "net/aether/chat", gen_chat, write_chat, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/addr", gen_addr, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/rank", gen_rank, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/parent", gen_parent, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/nodeid", gen_nodeid, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/tree", gen_tree, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/neighbors", gen_neighbors, NULL);
+	ninep_sysfs_register_file(&sysfs, "dev/aether/routes", gen_routes, NULL);
+	ninep_sysfs_register_writable_file(&sysfs, "dev/aether/chat", gen_chat, write_chat, NULL);
 	return 0;
 }
 
@@ -350,8 +359,8 @@ int aether_9p_init(struct net_if *iface)
 		.rx_buf_size = sizeof(rx_buf),
 	};
 	struct ninep_server_config sc = {
-		.fs_ops = ninep_sysfs_get_ops(),
-		.fs_ctx = &sysfs,
+		.fs_ops = ninep_union_fs_get_ops(),   /* serve the composed namespace */
+		.fs_ctx = &aether_union,
 		.max_message_size = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.version = "9P2000",
 	};
@@ -370,16 +379,45 @@ int aether_9p_init(struct net_if *iface)
 		LOG_ERR("sysfs init: %d", ret);
 		return ret;
 	}
-	ret = register_tree();
-	if (ret < 0) {
-		LOG_ERR("/net/aether registration: %d", ret);
-		return ret;
-	}
-	ret = register_dev();
+	ret = register_dev();              /* dev/ + firmware/reboot/confirm */
 	if (ret < 0) {
 		LOG_ERR("/dev/firmware registration: %d", ret);
 		return ret;
 	}
+	ret = register_dev_aether();       /* dev/aether/* node-state files */
+	if (ret < 0) {
+		LOG_ERR("/dev/aether registration: %d", ret);
+		return ret;
+	}
+
+	/* Bring up the /net/aether datagram service (registers the mesh recv cb +
+	 * builds its tree), then compose: sysfs at "/" + aether_net at "/net/aether". */
+	static const uint8_t zero_addr[6];
+	const uint8_t *myaddr = g_mesh_ctx ? g_mesh_ctx->local_addr : zero_addr;
+
+	ret = aether_net_init(iface, myaddr);
+	if (ret < 0) {
+		LOG_ERR("/net/aether init: %d", ret);
+		return ret;
+	}
+	ret = ninep_union_fs_init(&aether_union, aether_union_mounts,
+				  ARRAY_SIZE(aether_union_mounts));
+	if (ret < 0) {
+		LOG_ERR("union_fs init: %d", ret);
+		return ret;
+	}
+	ret = ninep_union_fs_mount(&aether_union, "/", ninep_sysfs_get_ops(), &sysfs);
+	if (ret < 0) {
+		LOG_ERR("union mount /: %d", ret);
+		return ret;
+	}
+	ret = ninep_union_fs_mount(&aether_union, "/net/aether",
+				   aether_net_get_ops(), aether_net_get_ctx());
+	if (ret < 0) {
+		LOG_ERR("union mount /net/aether: %d", ret);
+		return ret;
+	}
+
 	ret = ninep_transport_uart_init(&transport, &tc, NULL, NULL);
 	if (ret < 0) {
 		LOG_ERR("UART transport: %d", ret);
