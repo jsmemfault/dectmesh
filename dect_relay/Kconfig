@@ -1,0 +1,17 @@
+# dect_relay — nRF5340 9P/USB aggregator application configuration
+
+menu "dect_relay (nRF5340 9P/USB aggregator)"
+
+# Per-module log level. Defaults to LOG_DEFAULT_LEVEL (INF), at which the verbose
+# 9151-link diagnostics (mesh RX deliver / post-Tversion / post-Twalk / walk
+# hexdump) -- which are LOG_DBG -- compile out entirely. Set
+# CONFIG_DECT_RELAY_LOG_LEVEL_DBG=y to bring them back when debugging the link.
+module = DECT_RELAY
+module-str = dect_relay
+source "$(ZEPHYR_BASE)/subsys/logging/Kconfig.template.log_config"
+
+menu "Zephyr Kernel"
+source "Kconfig.zephyr"
+endmenu
+
+endmenu

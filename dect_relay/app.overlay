@@ -6,7 +6,9 @@
 
 / {
 	chosen {
-		zephyr,console = &cdc_acm_uart2;  /* relay's own log -> USB (CDC2) */
+		zephyr,console = &cdc_acm_uart2;     /* relay's own log -> USB (CDC2) */
+		zephyr,shell-uart = &cdc_acm_uart2;  /* interactive shell on CDC2 too
+						      * (board default was &rtt0 = J-Link only) */
 	};
 };
 
