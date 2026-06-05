@@ -31,7 +31,10 @@ nRF5340 · “DECTstrous Relay” · 9P AGGREGATOR (server to host ⇄ client to
                         │  9P over UART
                         ▼
 nRF9151 · “DECTstrous Mesh” · 9P SERVER (in-process with the mesh)
-   ├─ /net/aether    live mesh: address · neighbors · routes · tree · party-line `chat`
+   ├─ /net/aether    datagram service: clone → per-conversation ctl/data
+   │                 (Plan 9 /net-style; doc/NET_AETHER_SPEC.md) — proxied to
+   │                 the host by the relay via remote_fs
+   ├─ /dev/aether    node state: addr · rank · tree · neighbors · routes · chat
    ├─ /dev/firmware  its own MCUboot DFU  (re-exported by the relay as /dev/fw9151)
    ├─ Æther / HONR self-organizing, self-healing routing
    └─ DECT NR+ PHY radio  )))  ─────▶  other DECTstrous nodes
@@ -49,7 +52,8 @@ separate subsystems — a custom RPC for mesh state, mcumgr/SMP for DFU, shell c
 for control. Here they are one namespace:
 
 ```sh
-9p read  /net/aether/neighbors      # live mesh state
+9p read  /dev/aether/neighbors      # live mesh state
+9p ls    /net/aether                # datagram service: clone · status · addr
 9p write /dev/fw9151 < image.signed.bin   # firmware update
 9p read  /dev/link9151              # link health
 9p write /dev/reboot9151            # control
@@ -150,6 +154,26 @@ bytes); use **one socat per op** (a persistent `fork` server desyncs the per-ses
 **macOS has no `timeout`** command (it's `gtimeout`) — don't wrap serial captures in it or they
 silently no-op. The 5340 console/shell (`*105`) is a normal terminal: `screen /dev/cu.usbmodem*105`
 or any serial monitor.
+
+### Holding a `/net/aether` conversation (`tools/aether_conv.c`)
+
+`/net/aether` is a Plan 9 `/net`-style datagram service: you **walk `clone`** to allocate a
+conversation, then **keep that ctl fid open** while you walk `<N>/data` and read/write datagrams
+(doc/NET_AETHER_SPEC.md). plan9port's `9p` opens-and-clunks per invocation, so it can't hold the
+fid — it's fine for `ls /net/aether`, `read addr`, `read status`, but not the stateful dance. The
+relay re-exports the whole dynamic tree from the 9151 transparently (a `remote_fs` union mount), so
+a single fid-holding client drives it end to end:
+
+```sh
+cc -O2 -o /tmp/aether_conv tools/aether_conv.c
+# ONE persistent connection (not one-socat-per-op) for a fid-holding client:
+socat UNIX-LISTEN:/tmp/9p.sock,fork "$(ls /dev/cu.usbmodem*103|head -1)",rawer &
+/tmp/aether_conv /tmp/9p.sock 00:00:00:00:00:01     # clone→ctl→walk N/data→connect→send
+```
+
+It validates the full path: `clone` allocates conversation N, holding the ctl fid keeps it alive
+(`status` reports `1/4`), the deep walk to `N/data` succeeds, a `connect` ctl command + a datagram
+`write` go out over the DECT mesh, and clunking ctl tears the conversation down cleanly (`0/4`).
 
 ## Layout
 
