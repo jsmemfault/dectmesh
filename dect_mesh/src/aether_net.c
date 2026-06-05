@@ -495,9 +495,15 @@ static int anet_clunk(struct ninep_fs_node *node, void *ctx)
 	ARG_UNUSED(ctx);
 	struct anode *an = AN(node);
 
-	/* Clunking a conversation's ctl or dir tears the conversation down
-	 * (frees the slot + wakes a blocked data reader). */
-	if (an->conv && (an->kind == K_CTL || an->kind == K_CONVDIR)) {
+	/*
+	 * Tear the conversation down when its ctl fid is clunked -- ctl is the
+	 * fid you get from `clone` and hold for the conversation's life (spec
+	 * §5), so clunking it is the canonical hang-up. Do NOT tear down on a
+	 * convdir clunk: a multi-element walk (e.g. clone then walk N/data) and
+	 * an `ls N` both clunk the convdir fid incidentally, which must not free
+	 * a conversation the caller is still using.
+	 */
+	if (an->conv && an->kind == K_CTL) {
 		k_mutex_lock(&g_fs.lock, K_FOREVER);
 		conv_free(an->conv);
 		k_mutex_unlock(&g_fs.lock);
