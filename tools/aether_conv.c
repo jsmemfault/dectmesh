@@ -309,18 +309,37 @@ static int do_put(const char *path, const char *file, int chunk)
 	return 0;
 }
 
+/* Open a conversation, fire a blocking data read, and HOLD it (never tear down)
+ * so the caller can kill us mid-read -- the test for the async-worker epoch
+ * guard: on disconnect the read's worker must not inject a stale reply into a
+ * reused session. */
+static int do_hold(void)
+{
+	uint8_t rb[256];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	send_only(b_read(10, 2, 256));   /* blocking read, never replied (no datagram) */
+	printf("[ok] conv %d: blocking data read held open -- kill me now\n", conv);
+	for (;;) pause();   /* hold until killed */
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --put <path> <file> [chunk]]\n", argv[0]);
+		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --put <path> <file> [chunk]]\n", argv[0]);
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
 	const char *sock = argv[1];
 	const char *arg2 = argc > 2 ? argv[2] : NULL;
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
+	int hold = arg2 && strcmp(arg2, "--hold") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -330,6 +349,9 @@ int main(int argc, char **argv)
 	if (put) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --put <path> <file> [chunk]\n", argv[0]); return 2; }
 		return do_put(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 1024);
+	}
+	if (hold) {
+		return do_hold();
 	}
 	if (concurrent) {
 		return demo_concurrent();
