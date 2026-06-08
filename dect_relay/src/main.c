@@ -219,7 +219,7 @@ NINEP_SESSION_POOL_UART_DEFINE(fw_uart_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
  * literal: USB and BLE expose one filesystem with no per-transport logic. */
 NINEP_SESSION_POOL_L2CAP_DEFINE(fw_l2cap_pool, 1, CONFIG_NINEP_MAX_MESSAGE_SIZE);
 static struct ninep_sysfs fw_sysfs;
-static struct ninep_sysfs_entry fw_sysfs_entries[32];
+static struct ninep_sysfs_entry fw_sysfs_entries[48];
 static struct ninep_dfu fw_dfu;
 
 /*
@@ -769,6 +769,52 @@ static int fw9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
 	return ret;
 }
 
+/*
+ * dev/aether/*: re-export the 9151's mesh node-state (addr/rank/tree/neighbors/
+ * routes/...) read-only so the host (and BLE) can watch the DECT mesh form and
+ * route. ctx is the 9151-side path. These are short, non-blocking status reads,
+ * so open/read/clunk per call is fine -- the same pattern as /dev/fw9151.
+ *
+ * Curated (one registration per file) on purpose: this is a STATIC set of state
+ * files, distinct from the dynamic /net/aether datagram tree (clone/ctl/data),
+ * which is carried transparently by the general remote_fs proxy. They live on
+ * the 9151's /dev/aether per the spec; the 5340 re-exports them under the same
+ * path (a remote_fs mount at /dev/aether would be shadowed by fw_sysfs owning
+ * "/" -> /dev, so a sysfs-level forward composes more cleanly here).
+ */
+static int aether_state_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	const char *path = ctx;
+	uint32_t fid;
+	int ret = fw9151_open_remote(path, NINEP_OREAD, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret;
+}
+
+/* dev/aether/chat is the writable party-line; forward a write to the 9151. */
+static int aether_state_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(off);
+	const char *path = ctx;
+	uint32_t fid;
+	int ret = fw9151_open_remote(path, NINEP_OWRITE, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_write(&mesh_client, fid, 0, buf, count);
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret < 0 ? ret : (int)count;
+}
+
 /* write: stream a signed image to the 9151's secondary slot (one remote fid) */
 static int fw9151_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
 {
@@ -1012,6 +1058,29 @@ static int fw_9p_init(void)
 	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/fw9151auto",
 						    fw9151auto_read, fw9151auto_write,
 						    NULL, NULL);
+
+	/* dev/aether/*: the 9151's mesh node-state, proxied read-only over the
+	 * mesh link so the host can watch the DECT mesh form + route (neighbors,
+	 * routes, tree, rank, ...); chat is the writable party-line. Mirrors the
+	 * 9151's /dev/aether path 1:1. */
+	(void)ninep_sysfs_register_dir(&fw_sysfs, "dev/aether");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/addr",
+					aether_state_read, "dev/aether/addr");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/rank",
+					aether_state_read, "dev/aether/rank");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/parent",
+					aether_state_read, "dev/aether/parent");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/nodeid",
+					aether_state_read, "dev/aether/nodeid");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/tree",
+					aether_state_read, "dev/aether/tree");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/neighbors",
+					aether_state_read, "dev/aether/neighbors");
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/aether/routes",
+					aether_state_read, "dev/aether/routes");
+	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/aether/chat",
+						    aether_state_read, aether_state_write,
+						    NULL, "dev/aether/chat");
 
 	struct ninep_dfu_config dfu_cfg = {
 		.path = "dev/fw5340",
