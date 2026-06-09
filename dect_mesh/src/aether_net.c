@@ -191,12 +191,17 @@ static void conv_free(struct aether_conv *c)
 	if (!c->in_use) {
 		return;
 	}
-	/* wake a blocked reader with EOF, then tear down */
+	/* Tear down, then leave a SINGLE EOF sentinel (len 0) so a blocked reader
+	 * wakes and returns EOF. Order matters: purge first to drop any queued
+	 * datagrams, THEN put the sentinel last. The old order (put-then-purge)
+	 * raced -- if no reader was parked at that instant the sentinel went into
+	 * the ring buffer and the very next purge discarded it, so the reader (and,
+	 * through the relay's proxied read, its conversation) blocked forever. */
 	struct aether_dgram eof = { .len = 0 };
 
-	(void)k_msgq_put(&c->rxq, &eof, K_NO_WAIT);
 	unlink_child(&g_fs.root, &c->dir);
 	k_msgq_purge(&c->rxq);
+	(void)k_msgq_put(&c->rxq, &eof, K_NO_WAIT);
 	c->in_use = false;
 	c->state = CONV_UNCONNECTED;
 }
@@ -261,9 +266,14 @@ static int ctl_exec(struct aether_conv *c, const char *cmd)
 		return 0;
 	}
 	if (strcmp(cmd, "hangup") == 0) {
+		struct aether_dgram eof = { .len = 0 };
+
 		c->state = CONV_UNCONNECTED;
 		memset(c->peer, 0, sizeof(c->peer));
+		/* Wake any blocked data reader with an EOF sentinel: purge stale
+		 * datagrams first, then leave the len-0 sentinel as the last msg. */
 		k_msgq_purge(&c->rxq);
+		(void)k_msgq_put(&c->rxq, &eof, K_NO_WAIT);
 		return 0;
 	}
 	return -EINVAL;
