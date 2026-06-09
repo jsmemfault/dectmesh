@@ -356,6 +356,29 @@ static int do_recv(void)
 	return 0;
 }
 
+/* Connected-mode receiver: clone, connect to a specific peer, then blocking-read
+ * one datagram -- the connected path returns the bare payload (NO src prefix,
+ * and only datagrams from the bound peer are delivered). */
+static int do_crecv(const char *peer)
+{
+	uint8_t rb[600];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	printf("[crecv] conv %d connected to %s; blocking read (no src prefix expected)...\n", conv, peer);
+	n = do_read(2, 0, rb, sizeof(rb) - 1);
+	if (n < 0) { fprintf(stderr, "[crecv] read failed: %d\n", n); return 1; }
+	printf("[crecv] raw %d bytes:", n);
+	for (int i = 0; i < n; i++) printf(" %02x", rb[i]);
+	printf("\n[CRECV] %d bytes (connected, no prefix) : %.*s\n", n, n, (char *)rb);
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -368,8 +391,9 @@ int main(int argc, char **argv)
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
 	int hold = arg2 && strcmp(arg2, "--hold") == 0;
 	int recv = arg2 && strcmp(arg2, "--recv") == 0;
+	int crecv = arg2 && strcmp(arg2, "--crecv") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || crecv) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -385,6 +409,10 @@ int main(int argc, char **argv)
 	}
 	if (recv) {
 		return do_recv();
+	}
+	if (crecv) {
+		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --crecv <peer_addr>\n", argv[0]); return 2; }
+		return do_crecv(argv[3]);
 	}
 	if (concurrent) {
 		return demo_concurrent();
