@@ -342,6 +342,9 @@ static int do_recv(void)
 	printf("[recv] conv %d announced; blocking read for a datagram...\n", conv);
 	n = do_read(2, 0, rb, sizeof(rb) - 1);
 	if (n < 0) { fprintf(stderr, "[recv] read failed: %d\n", n); return 1; }
+	printf("[recv] raw %d bytes:", n);
+	for (int i = 0; i < n; i++) printf(" %02x", rb[i]);
+	printf("\n");
 	if (n >= 6) {
 		printf("[RECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
 		       n - 6, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], n - 6, (char *)rb + 6);
@@ -418,7 +421,7 @@ int main(int argc, char **argv)
 		char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
 		if (do_write(1, cmd, l) >= 0) printf("[ok] ctl: %s\n", cmd);
 		else fprintf(stderr, "ctl connect failed\n");
-		const char *msg = "hello from aether_conv";
+		const char *msg = argc > 3 ? argv[3] : "hello from aether_conv";
 		int w = do_write(2, msg, strlen(msg));
 		if (w >= 0) printf("[ok] sent %d-byte datagram to %s\n", w, peer);
 		else fprintf(stderr, "[info] data write returned error (no peer/ack?)\n");
