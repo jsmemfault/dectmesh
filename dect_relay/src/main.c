@@ -293,6 +293,7 @@ static const struct ninep_client_config mesh_client_cfg = {
 };
 static uint32_t mesh_root_fid;
 static bool mesh_attached;
+static bool mesh_versioned;   /* a Tversion has been negotiated on this link */
 /*
  * Two fine-grained locks instead of one coarse client lock (the 9p4z client is
  * now per-tag concurrency-safe, so it doesn't need external serialization):
@@ -515,6 +516,25 @@ static int mesh_ensure_attached(uint32_t *root)
 	uint32_t t0 = k_uptime_get_32();
 
 	mesh_rx_arrive_ms = 0;
+
+	/* Non-destructive re-attach. A Tversion CLEARS the 9151's entire 9P fid
+	 * table -- silently dropping any held /net/aether conversation ctl fids
+	 * (anet_clunk -> conv_free never runs), which is the conversation leak.
+	 * So once the link has been versioned, recover a stale root fid with a
+	 * plain re-Tattach first (preserves held fids), and only fall back to a
+	 * session-clearing Tversion if Tattach fails -- i.e. the 9151 actually
+	 * rebooted, where the conversations are gone anyway. */
+	if (mesh_versioned) {
+		ret = ninep_client_attach(&mesh_client, &mesh_root_fid, NINEP_NOFID,
+					  "relay", "");
+		if (ret == 0) {
+			LOG_INF("re-Tattached to 9151 (root fid %u, no Tversion)", mesh_root_fid);
+			goto attached;
+		}
+		LOG_INF("9151 re-Tattach failed (%d) -- session lost, re-versioning", ret);
+		mesh_versioned = false;
+	}
+
 	ret = ninep_client_version(&mesh_client);
 	uint32_t took = k_uptime_get_32() - t0;
 	int arrive = mesh_rx_arrive_ms ? (int)(mesh_rx_arrive_ms - t0) : -1;
@@ -526,6 +546,7 @@ static int mesh_ensure_attached(uint32_t *root)
 		k_mutex_unlock(&mesh_sess);
 		return ret;
 	}
+	mesh_versioned = true;
 	ret = ninep_client_attach(&mesh_client, &mesh_root_fid, NINEP_NOFID,
 				  "relay", "");
 	if (ret < 0) {
@@ -533,6 +554,7 @@ static int mesh_ensure_attached(uint32_t *root)
 		k_mutex_unlock(&mesh_sess);
 		return ret;
 	}
+attached:
 	mesh_attached = true;
 	mesh_relink_attempts = 0;
 	mesh_note_contact();
