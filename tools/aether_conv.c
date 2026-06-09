@@ -327,10 +327,36 @@ static int do_hold(void)
 	return 0;
 }
 
+/* Receiver: clone a conversation, ANNOUNCE (receive any datagram, source-
+ * prefixed), then blocking-read one datagram and print its source + payload.
+ * Pair with a sender (`aether_conv <peer-sock> <this-node-MAC>`). */
+static int do_recv(void)
+{
+	uint8_t rb[600];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	if (do_write(1, "announce", 8) < 0) { fprintf(stderr, "announce failed\n"); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	printf("[recv] conv %d announced; blocking read for a datagram...\n", conv);
+	n = do_read(2, 0, rb, sizeof(rb) - 1);
+	if (n < 0) { fprintf(stderr, "[recv] read failed: %d\n", n); return 1; }
+	if (n >= 6) {
+		printf("[RECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
+		       n - 6, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], n - 6, (char *)rb + 6);
+	} else {
+		printf("[recv] %d bytes (no src prefix): %.*s\n", n, n, (char *)rb);
+	}
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	printf("[recv] done\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --put <path> <file> [chunk]]\n", argv[0]);
+		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --recv | --put <path> <file> [chunk]]\n", argv[0]);
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
@@ -338,8 +364,9 @@ int main(int argc, char **argv)
 	const char *arg2 = argc > 2 ? argv[2] : NULL;
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
 	int hold = arg2 && strcmp(arg2, "--hold") == 0;
+	int recv = arg2 && strcmp(arg2, "--recv") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -352,6 +379,9 @@ int main(int argc, char **argv)
 	}
 	if (hold) {
 		return do_hold();
+	}
+	if (recv) {
+		return do_recv();
 	}
 	if (concurrent) {
 		return demo_concurrent();

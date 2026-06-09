@@ -3,6 +3,9 @@ build/
 build-*/
 build_*/
 
+# Compiled host tools (the source is committed, the binary is not)
+tools/aether_conv
+
 # Licensed Nordic DECT NR+ modem firmware — NEVER commit (per license agreement)
 dectfw/
 
