@@ -360,6 +360,31 @@ static int do_recv(int count)
 	return 0;
 }
 
+/* Held sender: ONE session -- clone, connect <peer>, send <count> datagrams
+ * spaced <gap_ms> apart, then exit. No per-send respawn, so the sender side
+ * does not churn the link either (pairs with a held `--recv <count>` receiver,
+ * so a reliability measurement reflects pure mesh delivery, not harness churn). */
+static int do_sendn(const char *peer, int count, int gap_ms)
+{
+	uint8_t rb[64];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	for (int k = 0; k < count; k++) {
+		char msg[32]; int ml = snprintf(msg, sizeof(msg), "sn-%d", k);
+		if (do_write(2, msg, ml) < 0) fprintf(stderr, "[sendn] write %d failed\n", k);
+		else printf("[SENT] %d : %s\n", k, msg);
+		if (gap_ms > 0) usleep((useconds_t)gap_ms * 1000);
+	}
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	printf("[sendn] done (%d sent)\n", count);
+	return 0;
+}
+
 /* Connected-mode receiver: clone, connect to a specific peer, then blocking-read
  * one datagram -- the connected path returns the bare payload (NO src prefix,
  * and only datagrams from the bound peer are delivered). */
@@ -383,6 +408,47 @@ static int do_crecv(const char *peer)
 	return 0;
 }
 
+/* Isolation: hold THREE conversations in ONE session -- c1 connected to <real>,
+ * c2 connected to <fake>, c3 announced -- and fire a concurrent blocking read on
+ * each data fid (distinct tags). A datagram from <real> must reach c1 (connected
+ * peer match) and c3 (announced), but NOT c2 (connected to a different peer).
+ * Prints [ISO cN] per delivery so the harness can assert c1+c3 received and c2
+ * did not. Held until killed (c2's read never completes). Proves peer-filtering
+ * + announced-receives-all + per-conversation isolation under concurrent traffic. */
+static int do_iso_recv(const char *real, const char *fake)
+{
+	uint8_t rb[700];
+	struct { uint32_t ctl, data; const char *mode, *peer; } cv[3] = {
+		{ 1, 11, "connect", real }, { 2, 12, "connect", fake }, { 3, 13, "announce", NULL },
+	};
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	for (int i = 0; i < 3; i++) {
+		char cmd[64], path[64];
+		if (do_walk(0, cv[i].ctl, "net/aether/clone") || do_open(cv[i].ctl, ORDWR)) {
+			fprintf(stderr, "clone c%d failed\n", i + 1); return 1;
+		}
+		int n = do_read(cv[i].ctl, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0;
+		int conv = atoi((char *)rb);
+		int l = cv[i].peer ? snprintf(cmd, sizeof(cmd), "%s %s", cv[i].mode, cv[i].peer)
+				   : snprintf(cmd, sizeof(cmd), "%s", cv[i].mode);
+		if (do_write(cv[i].ctl, cmd, l) < 0) { fprintf(stderr, "ctl c%d failed\n", i + 1); return 1; }
+		snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+		if (do_walk(0, cv[i].data, path) || do_open(cv[i].data, ORDWR)) {
+			fprintf(stderr, "data c%d failed\n", i + 1); return 1;
+		}
+	}
+	for (int i = 0; i < 3; i++) send_only(b_read(cv[i].data, cv[i].data, 512));
+	printf("[iso] armed: c1=connect(%s) c2=connect(%s) c3=announce; waiting...\n", real, fake);
+	for (;;) {
+		uint16_t tag; int ty = recv_one(rb, &tag);
+		if (ty < 0) { fprintf(stderr, "[iso] recv error\n"); return 1; }
+		if (ty != Rread) continue;
+		uint32_t n = g32(rb + 3);                       /* Rread: type[1] tag[2] count[4] data */
+		int c = (tag == 11) ? 1 : (tag == 12) ? 2 : (tag == 13) ? 3 : 0;
+		printf("[ISO c%d] %u bytes : %.*s\n", c, n, (int)n, (char *)rb + 7);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -396,8 +462,10 @@ int main(int argc, char **argv)
 	int hold = arg2 && strcmp(arg2, "--hold") == 0;
 	int recv = arg2 && strcmp(arg2, "--recv") == 0;
 	int crecv = arg2 && strcmp(arg2, "--crecv") == 0;
+	int iso = arg2 && strcmp(arg2, "--iso") == 0;
+	int sendn = arg2 && strcmp(arg2, "--sendn") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv || crecv) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -417,6 +485,14 @@ int main(int argc, char **argv)
 	if (crecv) {
 		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --crecv <peer_addr>\n", argv[0]); return 2; }
 		return do_crecv(argv[3]);
+	}
+	if (iso) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --iso <real_peer> <fake_peer>\n", argv[0]); return 2; }
+		return do_iso_recv(argv[3], argv[4]);
+	}
+	if (sendn) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --sendn <peer> <count> [gap_ms]\n", argv[0]); return 2; }
+		return do_sendn(argv[3], atoi(argv[4]), argc > 5 ? atoi(argv[5]) : 1500);
 	}
 	if (concurrent) {
 		return demo_concurrent();

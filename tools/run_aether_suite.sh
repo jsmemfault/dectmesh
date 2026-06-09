@@ -96,7 +96,7 @@ echo; echo "########## Phase 2: two-node datagram delivery (A <-> B) ##########"
 ann(){
   local got=""
   for attempt in 1 2; do
-    "$AC" "$1" --recv > /tmp/_r.log 2>&1 & local rp=$!; sleep 3
+    "$AC" "$1" --recv > /tmp/_r.log 2>&1 & local rp=$!; sleep 5
     TRUN_TO=10 trun "$AC" "$2" "$3" "$4" >/dev/null 2>&1
     sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
     got=$(grep '\[RECV\]' /tmp/_r.log | head -1); [ -n "$got" ] && break
@@ -115,7 +115,7 @@ ann(){
 conn(){
   local got=""
   for attempt in 1 2; do
-    "$AC" "$1" --crecv "$3" > /tmp/_c.log 2>&1 & local rp=$!; sleep 3
+    "$AC" "$1" --crecv "$3" > /tmp/_c.log 2>&1 & local rp=$!; sleep 5
     TRUN_TO=10 trun "$AC" "$2" "$4" "$5" >/dev/null 2>&1
     sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
     got=$(grep '\[CRECV\]' /tmp/_c.log | head -1); [ -n "$got" ] && break
@@ -132,22 +132,58 @@ ann  "$A" "$B" "$DA" "announced-B2A" "$DB" "announced receive B->A: length + pay
 conn "$A" "$B" "$DB" "$DA" "connected-B2A" "connected receive B->A: bare payload (no prefix)"
 ann  "$B" "$A" "$DB" "reverse-A2B"   "$DA" "reverse direction A->B announced receive"
 
-# reliability: 3 sequential sends to ONE persistent announced receiver. One held
-# session (announce once, read 3) -- no per-send respawn, so no announce-vs-arrival
-# race and no per-send DTR churn. This isolates genuine sequential-delivery loss.
-echo "  -- reliability: 3 sequential datagrams B->A (one held receiver) --"
-"$AC" "$A" --recv 3 > /tmp/_rel.log 2>&1 & rp=$!; sleep 5   # announce, then read up to 3
-for i in 1 2 3; do
-  TRUN_TO=8 trun "$AC" "$B" "$DA" "rel-$i" >/dev/null 2>&1
-  sleep 2
+# reliability: N sequential datagrams to ONE held receiver from ONE held sender.
+# Both sides hold a single session (no per-send respawn) -> zero harness churn,
+# so the delivered count reflects GENUINE mesh delivery, not test artifacts.
+REL_N=${REL_N:-10}
+echo "  -- reliability: $REL_N sequential datagrams B->A (both sides held) --"
+"$AC" "$A" --recv "$REL_N" > /tmp/_rel.log 2>&1 & rp=$!; sleep 5                       # held receiver
+TRUN_TO=$((REL_N * 2 + 15)) trun "$AC" "$B" --sendn "$DA" "$REL_N" 1200 >/dev/null 2>&1 # held sender
+sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
+rgot=$(grep -c '\[RECV\]' /tmp/_rel.log)
+[ "$rgot" -ge "$REL_N" ] && ok "reliability: $rgot/$REL_N datagrams delivered (both sides held)" \
+  || no "reliability: datagram loss" "$rgot/$REL_N delivered (both sides held)"
+
+# --- Phase 2b: concurrent multi-conversation isolation ---------------------
+# One held session on A holds 3 convs: c1 connect(B), c2 connect(bogus peer),
+# c3 announce. B sends ONE datagram -> c1 (peer match) and c3 (announced) must
+# receive it; c2 (connected to a different peer) must NOT. Proves peer-filtering
+# + announced-receives-all + per-conversation isolation under concurrent traffic.
+echo "  -- isolation: 3 concurrent convs on A (connect B / connect other / announce) --"
+"$AC" "$A" --iso "$DB" "00:00:00:00:00:99" > /tmp/_iso.log 2>&1 & rp=$!; sleep 4
+TRUN_TO=8 trun "$AC" "$B" "$DA" "iso-probe" >/dev/null 2>&1
+sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
+i1=$(grep -c '\[ISO c1\]' /tmp/_iso.log); i2=$(grep -c '\[ISO c2\]' /tmp/_iso.log); i3=$(grep -c '\[ISO c3\]' /tmp/_iso.log)
+if [ "$i1" -ge 1 ] && [ "$i3" -ge 1 ] && [ "$i2" = 0 ]; then
+  ok "isolation: connected(B) + announced received, connected(other) filtered (c1=$i1 c2=$i2 c3=$i3)"
+else
+  no "isolation: peer-filtering / concurrent delivery" "c1=$i1 (want>=1)  c2=$i2 (want 0)  c3=$i3 (want>=1)"
+fi
+
+# ==========================================================================
+# Soak: repeated full conformance, asserting status returns to 0/4 every cycle.
+# This is the regression net for the conversation leak -- if convs ever stop
+# freeing (on clunk or disconnect), status climbs and a cycle fails. Exercises
+# both in-session teardown (aether_test's own clone/clunk) and cross-session
+# teardown (status read after each run is a fresh session). SOAK_N overrides count.
+echo; echo "########## Phase 3: soak -- ${SOAK_N:-5}x conformance, no conversation leak over time ##########"
+SOAK_N=${SOAK_N:-5}
+soak_fail=0
+for c in $(seq 1 "$SOAK_N"); do
+  rr=$("$AT" "$A" 2>&1 | grep -oE '[0-9]+ passed, [0-9]+ failed')
+  settle
+  st=$("$P9" "$A" rd:net/aether/status 2>/dev/null | sed -n 's#.*=> ##p' | tr -cd '0-9/')
+  printf '  cycle %d/%d: %s ; status=%s\n' "$c" "$SOAK_N" "${rr:-NO RESULT}" "${st:-?}"
+  echo "$rr" | grep -q '^23 passed, 0 failed' || soak_fail=$((soak_fail+1))
+  [ "${st%%/*}" = "0" ] || soak_fail=$((soak_fail+1))
+  settle
 done
-sleep 2; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
-got=0; for i in 1 2 3; do grep -q "rel-$i" /tmp/_rel.log && got=$((got+1)); done
-[ "$got" = 3 ] && ok "reliability: 3/3 datagrams delivered" || no "reliability: datagram loss" "$got/3 delivered"
+[ "$soak_fail" = 0 ] && ok "soak: $SOAK_N cycles all 23/23 + status back to 0/4 (no conversation leak over time)" \
+  || no "soak: leak/regression over $SOAK_N cycles" "$soak_fail failed check(s)"
 
 # ==========================================================================
 echo; echo "########## SUMMARY ##########"
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" = 0 ] && echo "  ALL GREEN" \
-  || echo "  (A FAIL is a real regression OR a tool-handoff that needs more settle -- bump settle()."$'\n'"   Sanity check: a standalone 'tools/aether_test <sock>' should be 23/23. If it is, the link"$'\n'"   is fine and the suite just needs a longer beat between close/open on the size-1 DTR pool.)"
+  || echo "  (STRICT: a FAIL is a genuine gap, not flaky-by-design --"$'\n'"   - Phase 1 / soak fail WITH status 0/4: timing/handoff hiccup (bump settle) or a real conformance regression."$'\n'"   - reliability X/N (both sides held, zero harness churn): genuine mesh datagram loss"$'\n'"     -> investigate aether_mesh_send_reliable ack/retry budget + the DECT PHY (known ~90%)."$'\n'"   - soak fail WITH status climbing: the conversation leak is back (must stay 0/4)."$'\n'"   Sanity: a standalone 'tools/aether_test <sock>' should be 23/23.)"
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)
