@@ -9,6 +9,7 @@
 #include <zephyr/net/heymac.h>
 #include <zephyr/net/aether_mesh.h>
 #include <zephyr/net/honr.h>
+#include "aether_led.h"
 #include <zephyr/logging/log.h>
 #include <zephyr/shell/shell.h>
 
@@ -167,6 +168,9 @@ int main(void)
 	if (aether_9p_init(aether_iface) == 0 && IS_ENABLED(CONFIG_NINEP)) {
 		LOG_INF("9P server ready: /net/aether");
 	}
+
+	/* RGB LED mesh-state indicator (blue=root, green=child, amber=unjoined). */
+	aether_led_init(aether_iface);
 
 	/* Memfault: device identity + mesh heartbeat metrics (no-op without it). */
 	dect_metrics_init();

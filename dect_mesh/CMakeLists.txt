@@ -15,6 +15,7 @@ project(dect_mesh)
 zephyr_include_directories(config)
 
 target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/aether_led.c)
 target_sources_ifdef(CONFIG_NINEP app PRIVATE src/aether_9p.c)
 target_sources_ifdef(CONFIG_NINEP app PRIVATE src/aether_net.c)
 target_sources_ifdef(CONFIG_MEMFAULT app PRIVATE src/dect_metrics.c)
