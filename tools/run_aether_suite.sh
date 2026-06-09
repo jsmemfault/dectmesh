@@ -18,6 +18,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 NP="${NP:-$HOME/src/plan9port/bin/9p}"
 AC="$HERE/aether_conv"
 AT="$HERE/aether_test"
+P9="$HERE/p9do"
 SA=/tmp/aether_A.sock
 SB=/tmp/aether_B.sock
 PASS=0; FAIL=0
@@ -33,6 +34,7 @@ trun(){ "$@" & local p=$!; for i in $(seq 1 "${TRUN_TO:-10}"); do kill -0 "$p" 2
 # --- build the host tools --------------------------------------------------
 cc -O2 -o "$AC" "$HERE/aether_conv.c" || { echo "build aether_conv failed"; exit 2; }
 cc -O2 -o "$AT" "$HERE/aether_test.c" || { echo "build aether_test failed"; exit 2; }
+cc -O2 -o "$P9" "$HERE/p9do.c"        || { echo "build p9do failed"; exit 2; }
 
 # --- ports + socats --------------------------------------------------------
 PORTS=($(ls /dev/cu.usbmodem*3 2>/dev/null))
@@ -41,21 +43,26 @@ pkill -f 'socat.*usbmodem' 2>/dev/null; sleep 2; rm -f "$SA" "$SB"
 socat UNIX-LISTEN:"$SA",fork "${PORTS[0]}",rawer & socat UNIX-LISTEN:"$SB",fork "${PORTS[1]}",rawer & sleep 3
 trap 'pkill -f "socat.*usbmodem" 2>/dev/null' EXIT
 
-nid(){ bnd 12 "$NP -a unix!$1 read /dev/aether/nodeid" | tr -d '\n'; }
-# robust HONR-addr read: sanitize, retry on glitch
-read_addr(){ local a; for t in 1 2 3 4 5; do
-  a=$(bnd 10 "$NP -a unix!$1 read /dev/aether/addr" | tr -cd '0-9a-f'); a=${a:0:4}
-  [ "${#a}" -ge 3 ] && { echo "$a"; return; }; sleep 1; done; echo ""; }
+# Persistent-session reads via p9do: ONE held 9P session per call, and BATCHED
+# (nodeid + addr together), instead of per-command 9p(1) that opens/closes the
+# port every read. The relay's DTR session pool is size 1, so per-command churn
+# degrades the USB-CDC -- this convergence loop alone used to fire ~150 open/close
+# cycles before Phase 2, wedging the link. Hold + batch + fewer iterations.
+conv_read(){ "$P9" "$1" rd:dev/aether/nodeid rd:dev/aether/addr 2>/dev/null; }
+hex4(){ local a; a=$(echo "$1" | tr -cd '0-9a-f'); echo "${a:0:4}"; }
 
 A=$SA; B=$SB
-ida=$(nid "$SA"); idb=$(nid "$SB")
 
 # --- wait for the mesh to converge to DISTINCT addresses -------------------
 echo "waiting for convergence (distinct HONR addrs)..."
-adA=""; adB=""
-for t in $(seq 1 15); do
-  adA=$(read_addr "$A"); adB=$(read_addr "$B")
-  [ -n "$adA" ] && [ -n "$adB" ] && [ "$adA" != "$adB" ] && break
+ida=""; idb=""; adA=""; adB=""
+for t in $(seq 1 10); do
+  oa=$(conv_read "$A"); ob=$(conv_read "$B")
+  ida=$(echo "$oa" | sed -n 's#.*nodeid => ##p' | tr -cd '0-9a-f')
+  idb=$(echo "$ob" | sed -n 's#.*nodeid => ##p' | tr -cd '0-9a-f')
+  adA=$(hex4 "$(echo "$oa" | sed -n 's#.*addr => ##p')")
+  adB=$(hex4 "$(echo "$ob" | sed -n 's#.*addr => ##p')")
+  [ "${#adA}" -ge 3 ] && [ "${#adB}" -ge 3 ] && [ "$adA" != "$adB" ] && break
   sleep 2
 done
 DA="00:00:00:00:${adA:0:2}:${adA:2:2}"
