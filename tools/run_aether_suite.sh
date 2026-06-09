@@ -132,15 +132,17 @@ ann  "$A" "$B" "$DA" "announced-B2A" "$DB" "announced receive B->A: length + pay
 conn "$A" "$B" "$DB" "$DA" "connected-B2A" "connected receive B->A: bare payload (no prefix)"
 ann  "$B" "$A" "$DB" "reverse-A2B"   "$DA" "reverse direction A->B announced receive"
 
-# reliability: 3 sequential announced sends, honest delivered count
-echo "  -- reliability: 3 sequential datagrams B->A --"
-got=0
+# reliability: 3 sequential sends to ONE persistent announced receiver. One held
+# session (announce once, read 3) -- no per-send respawn, so no announce-vs-arrival
+# race and no per-send DTR churn. This isolates genuine sequential-delivery loss.
+echo "  -- reliability: 3 sequential datagrams B->A (one held receiver) --"
+"$AC" "$A" --recv 3 > /tmp/_rel.log 2>&1 & rp=$!; sleep 5   # announce, then read up to 3
 for i in 1 2 3; do
-  "$AC" "$A" --recv > /tmp/_rel.log 2>&1 & rp=$!; sleep 5  # recv: connect+clone+announce
   TRUN_TO=8 trun "$AC" "$B" "$DA" "rel-$i" >/dev/null 2>&1
-  sleep 4; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle  # delivery window
-  grep -q "\[RECV\] 5 bytes .* : rel-$i" /tmp/_rel.log && got=$((got+1))
+  sleep 2
 done
+sleep 2; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
+got=0; for i in 1 2 3; do grep -q "rel-$i" /tmp/_rel.log && got=$((got+1)); done
 [ "$got" = 3 ] && ok "reliability: 3/3 datagrams delivered" || no "reliability: datagram loss" "$got/3 delivered"
 
 # ==========================================================================

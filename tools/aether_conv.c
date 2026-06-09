@@ -330,7 +330,7 @@ static int do_hold(void)
 /* Receiver: clone a conversation, ANNOUNCE (receive any datagram, source-
  * prefixed), then blocking-read one datagram and print its source + payload.
  * Pair with a sender (`aether_conv <peer-sock> <this-node-MAC>`). */
-static int do_recv(void)
+static int do_recv(int count)
 {
 	uint8_t rb[600];
 	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
@@ -339,17 +339,21 @@ static int do_recv(void)
 	if (do_write(1, "announce", 8) < 0) { fprintf(stderr, "announce failed\n"); return 1; }
 	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
 	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
-	printf("[recv] conv %d announced; blocking read for a datagram...\n", conv);
-	n = do_read(2, 0, rb, sizeof(rb) - 1);
-	if (n < 0) { fprintf(stderr, "[recv] read failed: %d\n", n); return 1; }
-	printf("[recv] raw %d bytes:", n);
-	for (int i = 0; i < n; i++) printf(" %02x", rb[i]);
-	printf("\n");
-	if (n >= 6) {
-		printf("[RECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
-		       n - 6, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], n - 6, (char *)rb + 6);
-	} else {
-		printf("[recv] %d bytes (no src prefix): %.*s\n", n, n, (char *)rb);
+	/* ONE announced session reads up to `count` datagrams back-to-back (the conv
+	 * stays announced; the rxq buffers bursts). This avoids respawning a receiver
+	 * per datagram -- which raced announce-vs-arrival and churned the DTR session
+	 * pool -- so a sequential-delivery (reliability) check reads cleanly. */
+	printf("[recv] conv %d announced; reading up to %d datagram(s) in one session...\n", conv, count);
+	for (int k = 0; k < count; k++) {
+		n = do_read(2, 0, rb, sizeof(rb) - 1);
+		if (n < 0) { fprintf(stderr, "[recv] read failed: %d\n", n); break; }
+		if (n == 0) { printf("[recv] EOF (hangup)\n"); break; }
+		if (n >= 6) {
+			printf("[RECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
+			       n - 6, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], n - 6, (char *)rb + 6);
+		} else {
+			printf("[recv] %d bytes (no src prefix): %.*s\n", n, n, (char *)rb);
+		}
 	}
 	do_clunk(2); do_clunk(1); do_clunk(0);
 	printf("[recv] done\n");
@@ -408,7 +412,7 @@ int main(int argc, char **argv)
 		return do_hold();
 	}
 	if (recv) {
-		return do_recv();
+		return do_recv(argc > 3 ? atoi(argv[3]) : 1);   /* --recv [count] */
 	}
 	if (crecv) {
 		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --crecv <peer_addr>\n", argv[0]); return 2; }
