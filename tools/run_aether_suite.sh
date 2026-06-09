@@ -30,6 +30,13 @@ bnd(){ local to=$1; shift; eval "$@" >/tmp/_o 2>&1 & local n=$!
   for i in $(seq 1 "$to"); do kill -0 "$n" 2>/dev/null || break; sleep 1; done
   kill -0 "$n" 2>/dev/null && kill -9 "$n" 2>/dev/null; cat /tmp/_o; }
 trun(){ "$@" & local p=$!; for i in $(seq 1 "${TRUN_TO:-10}"); do kill -0 "$p" 2>/dev/null || break; sleep 1; done; kill -9 "$p" 2>/dev/null; }
+# Settle between tool-to-tool port handoffs. Each tool (p9do/aether_test/aether_conv)
+# opens the port via socat,fork; closing it deasserts DTR and the relay's size-1
+# session pool tears the session down, then the next tool's open re-asserts DTR and
+# re-establishes. Back-to-back (no settle) hiccups the relay CDC -> the next tool's
+# first write gets EPIPE. A beat between handoffs avoids it. (The link is fine -- a
+# standalone aether_test is 23/23; only the un-settled handoff trips it.)
+settle(){ sleep 3; }
 
 # --- build the host tools --------------------------------------------------
 cc -O2 -o "$AC" "$HERE/aether_conv.c" || { echo "build aether_conv failed"; exit 2; }
@@ -72,13 +79,15 @@ if [ -z "$adA" ] || [ -z "$adB" ] || [ "$adA" = "$adB" ]; then
   no "convergence" "nodes did not reach distinct addrs (A=$adA B=$adB) -- Phase 2 unreliable"
 fi
 
+settle  # let the convergence reads' connection fully release before Phase 1 opens
+
 # ==========================================================================
 echo; echo "########## Phase 1: single-node /net/aether conformance (node A) ##########"
 P1=$("$AT" "$A")
 echo "$P1" | sed 's/^/  /'
 r=$(echo "$P1" | grep -oE '[0-9]+ passed, [0-9]+ failed')
 [ -n "$r" ] && { PASS=$((PASS + ${r% passed*})); FAIL=$((FAIL + $(echo "$r" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+'))); }
-sleep 1
+settle  # Phase 1 (aether_test) closed node A; let it release before Phase 2 opens
 
 # ==========================================================================
 echo; echo "########## Phase 2: two-node datagram delivery (A <-> B) ##########"
@@ -89,7 +98,7 @@ ann(){
   for attempt in 1 2; do
     "$AC" "$1" --recv > /tmp/_r.log 2>&1 & local rp=$!; sleep 3
     TRUN_TO=10 trun "$AC" "$2" "$3" "$4" >/dev/null 2>&1
-    sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; sleep 1
+    sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
     got=$(grep '\[RECV\]' /tmp/_r.log | head -1); [ -n "$got" ] && break
   done
   if [ -z "$got" ]; then no "$6" "no delivery (2 attempts)"; return; fi
@@ -108,7 +117,7 @@ conn(){
   for attempt in 1 2; do
     "$AC" "$1" --crecv "$3" > /tmp/_c.log 2>&1 & local rp=$!; sleep 3
     TRUN_TO=10 trun "$AC" "$2" "$4" "$5" >/dev/null 2>&1
-    sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; sleep 1
+    sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
     got=$(grep '\[CRECV\]' /tmp/_c.log | head -1); [ -n "$got" ] && break
   done
   if [ -z "$got" ]; then no "$6" "no delivery (2 attempts)"; return; fi
@@ -127,9 +136,9 @@ ann  "$B" "$A" "$DB" "reverse-A2B"   "$DA" "reverse direction A->B announced rec
 echo "  -- reliability: 3 sequential datagrams B->A --"
 got=0
 for i in 1 2 3; do
-  "$AC" "$A" --recv > /tmp/_rel.log 2>&1 & rp=$!; sleep 3
+  "$AC" "$A" --recv > /tmp/_rel.log 2>&1 & rp=$!; sleep 5  # recv: connect+clone+announce
   TRUN_TO=8 trun "$AC" "$B" "$DA" "rel-$i" >/dev/null 2>&1
-  sleep 2; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; sleep 1
+  sleep 4; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle  # delivery window
   grep -q "\[RECV\] 5 bytes .* : rel-$i" /tmp/_rel.log && got=$((got+1))
 done
 [ "$got" = 3 ] && ok "reliability: 3/3 datagrams delivered" || no "reliability: datagram loss" "$got/3 delivered"
@@ -138,5 +147,5 @@ done
 echo; echo "########## SUMMARY ##########"
 echo "  PASS=$PASS  FAIL=$FAIL"
 [ "$FAIL" = 0 ] && echo "  ALL GREEN" \
-  || echo "  (Phase 1 exhaustion checks can trip the known ninep_union_fs multi-conv bug;"$'\n'"   Phase 2 needs a healthy USB-CDC -- re-run on a fresh USB if writes are wedged)"
+  || echo "  (A FAIL is a real regression OR a tool-handoff that needs more settle -- bump settle()."$'\n'"   Sanity check: a standalone 'tools/aether_test <sock>' should be 23/23. If it is, the link"$'\n'"   is fine and the suite just needs a longer beat between close/open on the size-1 DTR pool.)"
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)
