@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
+#include <signal.h>
 
 enum {
 	Tversion = 100, Rversion = 101, Tattach = 104, Rattach = 105,
@@ -41,6 +42,14 @@ enum {
 
 static int fd;
 static uint8_t mbuf[MSIZE];
+
+/* SIGINT/SIGTERM set this; the receive loops (do_recv/do_crecv) check it and the
+ * blocked read() returns EINTR (handler installed WITHOUT SA_RESTART), so a killed
+ * receiver falls through to its do_clunk() instead of leaking the conversation.
+ * The /net/aether pool is only 4 deep and an orphaned ctl fid survives a socat
+ * restart (the shared DTR session never drops), so leak-on-kill exhausts it fast. */
+static volatile sig_atomic_t g_stop = 0;
+static void on_term(int s) { (void)s; g_stop = 1; }
 
 static void p16(uint8_t *b, uint16_t v) { b[0] = v; b[1] = v >> 8; }
 static void p32(uint8_t *b, uint32_t v) { b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24; }
@@ -336,17 +345,17 @@ static int do_recv(int count)
 	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
 	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
 	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
-	if (do_write(1, "announce", 8) < 0) { fprintf(stderr, "announce failed\n"); return 1; }
+	if (do_write(1, "announce", 8) < 0) { fprintf(stderr, "announce failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
-	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	/* ONE announced session reads up to `count` datagrams back-to-back (the conv
 	 * stays announced; the rxq buffers bursts). This avoids respawning a receiver
 	 * per datagram -- which raced announce-vs-arrival and churned the DTR session
 	 * pool -- so a sequential-delivery (reliability) check reads cleanly. */
 	printf("[recv] conv %d announced; reading up to %d datagram(s) in one session...\n", conv, count);
-	for (int k = 0; k < count; k++) {
+	for (int k = 0; k < count && !g_stop; k++) {
 		n = do_read(2, 0, rb, sizeof(rb) - 1);
-		if (n < 0) { fprintf(stderr, "[recv] read failed: %d\n", n); break; }
+		if (n < 0) { if (!g_stop) fprintf(stderr, "[recv] read failed: %d\n", n); break; }
 		if (n == 0) { printf("[recv] EOF (hangup)\n"); break; }
 		if (n >= 6) {
 			printf("[RECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
@@ -371,10 +380,10 @@ static int do_sendn(const char *peer, int count, int gap_ms)
 	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
 	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
 	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
-	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); return 1; }
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
-	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
-	for (int k = 0; k < count; k++) {
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	for (int k = 0; k < count && !g_stop; k++) {
 		char msg[32]; int ml = snprintf(msg, sizeof(msg), "sn-%d", k);
 		if (do_write(2, msg, ml) < 0) fprintf(stderr, "[sendn] write %d failed\n", k);
 		else printf("[SENT] %d : %s\n", k, msg);
@@ -395,12 +404,13 @@ static int do_crecv(const char *peer)
 	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
 	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
 	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
-	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); return 1; }
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
-	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	printf("[crecv] conv %d connected to %s; blocking read (no src prefix expected)...\n", conv, peer);
 	n = do_read(2, 0, rb, sizeof(rb) - 1);
-	if (n < 0) { fprintf(stderr, "[crecv] read failed: %d\n", n); return 1; }
+	if (n < 0) { if (!g_stop) fprintf(stderr, "[crecv] read failed: %d\n", n);
+		do_clunk(2); do_clunk(1); do_clunk(0); return 1; }
 	printf("[crecv] raw %d bytes:", n);
 	for (int i = 0; i < n; i++) printf(" %02x", rb[i]);
 	printf("\n[CRECV] %d bytes (connected, no prefix) : %.*s\n", n, n, (char *)rb);
@@ -456,6 +466,12 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
+	/* Interrupt (don't SA_RESTART) a blocked read on SIGINT/SIGTERM so receivers
+	 * clunk their conversation on kill instead of leaking it. */
+	struct sigaction sa = { .sa_handler = on_term, .sa_flags = 0 };
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
 	const char *sock = argv[1];
 	const char *arg2 = argc > 2 ? argv[2] : NULL;
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
