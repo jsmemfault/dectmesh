@@ -11,9 +11,12 @@
  *       clone            open/walk -> allocate a conversation; read -> "N"
  *       status           "<active>/<max>" + neighbour summary
  *       addr             this node's 6-byte mesh address (colon-hex)
+ *       stats            stats(5)-style datagram counters (sent/rcvd/...)
  *       <N>/             one conversation (N = 0 .. MAX_CONNS-1)
  *           ctl          write: connect <addr> | announce | hangup ; read "N\n"
- *           data         one datagram per read/write (read blocks)
+ *           data         one datagram per read/write (read blocks); connected ->
+ *                        bare payload, announced -> [src]-prefixed read /
+ *                        [dst]-prefixed write
  *           local        local address
  *           remote       peer address, or empty if unbound
  *           status       connected <addr> reliable | announced | unconnected
@@ -51,7 +54,7 @@ enum conv_state { CONV_UNCONNECTED = 0, CONV_CONNECTED, CONV_ANNOUNCED };
 /* node "kind" so an fs_ops callback can dispatch from the bare node. Stored in
  * ninep_fs_node.data. */
 enum anode_kind {
-	K_ROOT = 0, K_CLONE, K_TOPSTATUS, K_ADDR,
+	K_ROOT = 0, K_CLONE, K_TOPSTATUS, K_ADDR, K_STATS,
 	K_CONVDIR, K_CTL, K_DATA, K_LOCAL, K_REMOTE, K_CSTATUS,
 };
 
@@ -79,8 +82,16 @@ struct aether_net_fs {
 	uint8_t myaddr[6];
 	uint32_t next_qid;
 
-	struct ninep_fs_node root, clone, topstatus, addr;
-	struct anode an_root, an_clone, an_topstatus, an_addr;
+	struct ninep_fs_node root, clone, topstatus, addr, statf;
+	struct anode an_root, an_clone, an_topstatus, an_addr, an_statf;
+
+	/* stats(5)-style datagram counters, surfaced at /net/aether/stats. Each
+	 * field is touched from one context (tx_* from the writer thread, rx_*
+	 * from the mesh RX callback), so plain uint32_t increments suffice. */
+	struct {
+		uint32_t tx, tx_bytes, tx_err;
+		uint32_t rx, rx_bytes, rx_drop;
+	} ctr;
 
 	struct aether_conv convs[AETHER_MAX_CONNS];
 	struct k_mutex lock;
@@ -222,6 +233,8 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 		len = AETHER_MAX_MSG;
 	}
 	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	g_fs.ctr.rx++;
+	g_fs.ctr.rx_bytes += (uint32_t)len;
 	for (int i = 0; i < AETHER_MAX_CONNS; i++) {
 		struct aether_conv *c = &g_fs.convs[i];
 
@@ -239,6 +252,7 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 		d.len = (uint16_t)len;
 		memcpy(d.data, payload, len);
 		if (k_msgq_put(&c->rxq, &d, K_NO_WAIT) != 0) {
+			g_fs.ctr.rx_drop++;
 			LOG_WRN("conv %d rxq full, dropping datagram", i);
 		}
 	}
@@ -366,7 +380,7 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 	ARG_UNUSED(uname); ARG_UNUSED(ctx);
 	struct anode *an = AN(node);
 	struct aether_conv *c = an->conv;
-	char s[96];
+	char s[256];
 	int n = 0;
 
 	switch (an->kind) {
@@ -386,6 +400,16 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		n = snprintf(s, sizeof(s), "%d/%d\n", active, AETHER_MAX_CONNS);
 		break;
 	}
+	case K_STATS:
+		/* stats(5)-style: datagram counters at the /net/aether layer. "sent"/
+		 * "rcvd" are whole datagrams (post-reassembly/dedup), bytes are payload
+		 * only, tx_err = reliable-send gave up, rx_drop = a conv rxq was full. */
+		n = snprintf(s, sizeof(s),
+			     "sent %u\nrcvd %u\nsent_bytes %u\nrcvd_bytes %u\n"
+			     "tx_err %u\nrx_drop %u\n",
+			     g_fs.ctr.tx, g_fs.ctr.rx, g_fs.ctr.tx_bytes,
+			     g_fs.ctr.rx_bytes, g_fs.ctr.tx_err, g_fs.ctr.rx_drop);
+		break;
 	case K_CLONE:
 	case K_CTL:
 		n = snprintf(s, sizeof(s), "%d\n", c ? c->slot : 0);
@@ -480,16 +504,42 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 	}
 
 	if (an->kind == K_DATA) {
-		if (!c || c->state != CONV_CONNECTED) {
+		const uint8_t *dst, *payload;
+		uint32_t plen;
+
+		if (!c) {
 			return -ENOTCONN;
 		}
-		if (count > AETHER_MAX_MSG) {
+		if (c->state == CONV_CONNECTED) {
+			/* connected: bare payload -> the bound peer (spec §4). */
+			dst = c->peer;
+			payload = buf;
+			plen = count;
+		} else if (c->state == CONV_ANNOUNCED) {
+			/* announced: [dst][payload] -> reply to a requester (spec §4/§8),
+			 * symmetric with the source-prefixed announced read. This is what
+			 * lets a node be a 9P server/exporter over the mesh. */
+			if (count < 6) {
+				return -EINVAL;
+			}
+			dst = buf;
+			payload = buf + 6;
+			plen = count - 6;
+		} else {
+			return -ENOTCONN;
+		}
+		if (plen > AETHER_MAX_MSG) {
 			return -EMSGSIZE;
 		}
-		int ret = aether_mesh_send_reliable(g_fs.iface, c->peer, buf, count,
+		int ret = aether_mesh_send_reliable(g_fs.iface, dst, payload, plen,
 						    AETHER_NET_RETRIES);
-
-		return ret < 0 ? ret : (int)count;
+		if (ret < 0) {
+			g_fs.ctr.tx_err++;
+			return ret;
+		}
+		g_fs.ctr.tx++;
+		g_fs.ctr.tx_bytes += plen;
+		return (int)count;   /* whole write consumed (incl. any dst prefix) */
 	}
 	return -EROFS;
 }
@@ -560,9 +610,11 @@ int aether_net_init(struct net_if *iface, const uint8_t myaddr[6])
 	node_init(&g_fs.clone, "clone", NINEP_NODE_FILE, &g_fs.an_clone, K_CLONE, NULL);
 	node_init(&g_fs.topstatus, "status", NINEP_NODE_FILE, &g_fs.an_topstatus, K_TOPSTATUS, NULL);
 	node_init(&g_fs.addr, "addr", NINEP_NODE_FILE, &g_fs.an_addr, K_ADDR, NULL);
+	node_init(&g_fs.statf, "stats", NINEP_NODE_FILE, &g_fs.an_statf, K_STATS, NULL);
 	link_child(&g_fs.root, &g_fs.clone);
 	link_child(&g_fs.root, &g_fs.topstatus);
 	link_child(&g_fs.root, &g_fs.addr);
+	link_child(&g_fs.root, &g_fs.statf);
 
 	int ret = aether_mesh_register_recv_callback(iface, aether_recv_cb, NULL);
 
