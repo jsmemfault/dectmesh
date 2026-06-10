@@ -12,6 +12,7 @@
  *       status           "<active>/<max>" + neighbour summary
  *       addr             this node's 6-byte mesh address (colon-hex)
  *       stats            stats(5)-style datagram counters (sent/rcvd/...)
+ *       maxmsg           reassembled-datagram ceiling in bytes (spec §6)
  *       <N>/             one conversation (N = 0 .. MAX_CONNS-1)
  *           ctl          write: connect <addr> | announce | hangup ; read "N\n"
  *           data         one datagram per read/write (read blocks); connected ->
@@ -54,7 +55,7 @@ enum conv_state { CONV_UNCONNECTED = 0, CONV_CONNECTED, CONV_ANNOUNCED };
 /* node "kind" so an fs_ops callback can dispatch from the bare node. Stored in
  * ninep_fs_node.data. */
 enum anode_kind {
-	K_ROOT = 0, K_CLONE, K_TOPSTATUS, K_ADDR, K_STATS,
+	K_ROOT = 0, K_CLONE, K_TOPSTATUS, K_ADDR, K_STATS, K_MAXMSG,
 	K_CONVDIR, K_CTL, K_DATA, K_LOCAL, K_REMOTE, K_CSTATUS,
 };
 
@@ -82,8 +83,8 @@ struct aether_net_fs {
 	uint8_t myaddr[6];
 	uint32_t next_qid;
 
-	struct ninep_fs_node root, clone, topstatus, addr, statf;
-	struct anode an_root, an_clone, an_topstatus, an_addr, an_statf;
+	struct ninep_fs_node root, clone, topstatus, addr, statf, maxmsgf;
+	struct anode an_root, an_clone, an_topstatus, an_addr, an_statf, an_maxmsgf;
 
 	/* stats(5)-style datagram counters, surfaced at /net/aether/stats. Each
 	 * field is touched from one context (tx_* from the writer thread, rx_*
@@ -410,6 +411,11 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 			     g_fs.ctr.tx, g_fs.ctr.rx, g_fs.ctr.tx_bytes,
 			     g_fs.ctr.rx_bytes, g_fs.ctr.tx_err, g_fs.ctr.rx_drop);
 		break;
+	case K_MAXMSG:
+		/* spec §6: advertise the reassembled-datagram ceiling so a mounter can
+		 * negotiate msize <= it. One DECT frame today (no fragmentation). */
+		n = snprintf(s, sizeof(s), "%d\n", AETHER_MAX_MSG);
+		break;
 	case K_CLONE:
 	case K_CTL:
 		n = snprintf(s, sizeof(s), "%d\n", c ? c->slot : 0);
@@ -611,10 +617,12 @@ int aether_net_init(struct net_if *iface, const uint8_t myaddr[6])
 	node_init(&g_fs.topstatus, "status", NINEP_NODE_FILE, &g_fs.an_topstatus, K_TOPSTATUS, NULL);
 	node_init(&g_fs.addr, "addr", NINEP_NODE_FILE, &g_fs.an_addr, K_ADDR, NULL);
 	node_init(&g_fs.statf, "stats", NINEP_NODE_FILE, &g_fs.an_statf, K_STATS, NULL);
+	node_init(&g_fs.maxmsgf, "maxmsg", NINEP_NODE_FILE, &g_fs.an_maxmsgf, K_MAXMSG, NULL);
 	link_child(&g_fs.root, &g_fs.clone);
 	link_child(&g_fs.root, &g_fs.topstatus);
 	link_child(&g_fs.root, &g_fs.addr);
 	link_child(&g_fs.root, &g_fs.statf);
+	link_child(&g_fs.root, &g_fs.maxmsgf);
 
 	int ret = aether_mesh_register_recv_callback(iface, aether_recv_cb, NULL);
 
