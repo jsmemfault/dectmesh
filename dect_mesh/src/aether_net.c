@@ -31,7 +31,11 @@
 LOG_MODULE_REGISTER(aether_net, LOG_LEVEL_INF);
 
 #define AETHER_MAX_CONNS   4
-#define AETHER_MAX_MSG     512
+/* One datagram = one DECT frame payload. Track the mesh payload cap so the
+ * /net/aether write limit and the rxq buffers match what aether_mesh_send can
+ * actually carry (no "9P accepts it but the mesh rejects it" gap). DECT-sized,
+ * not the old 512 LoRa-era value. */
+#define AETHER_MAX_MSG     CONFIG_AETHER_MAX_PAYLOAD
 #define AETHER_RXQ_DEPTH   4
 #define AETHER_NET_RETRIES 3     /* reliable-send retry budget (DECT PHY also helps) */
 

@@ -394,6 +394,37 @@ static int do_sendn(const char *peer, int count, int gap_ms)
 	return 0;
 }
 
+/* Big-datagram sender: send <count> datagrams of <nbytes> each (filled with a
+ * verifiable pattern: byte i = 'A' + (i % 26), with a 4-char "bNNN" tag at the
+ * front), spaced <gap_ms> apart. Validates that the DECT per-frame TBS sizing
+ * carries a full payload end-to-end -- the suite only sends ~13-byte frames that
+ * fit even the old fixed 69-byte block, so they never exercised large frames. */
+static int do_sendbig(const char *peer, int nbytes, int count, int gap_ms)
+{
+	uint8_t rb[64];
+	static uint8_t payload[600];
+	if (nbytes < 1) nbytes = 1;
+	if (nbytes > (int)sizeof(payload)) nbytes = sizeof(payload);
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	for (int k = 0; k < count && !g_stop; k++) {
+		for (int i = 0; i < nbytes; i++) payload[i] = 'A' + (i % 26);
+		int hl = snprintf((char *)payload, nbytes, "b%03d-", k);
+		if (hl > 0 && hl < nbytes) payload[hl] = 'A';   /* undo snprintf's NUL */
+		if (do_write(2, payload, nbytes) < 0) fprintf(stderr, "[sendbig] write %d failed\n", k);
+		else printf("[SENTBIG] %d : %d bytes\n", k, nbytes);
+		if (gap_ms > 0) usleep((useconds_t)gap_ms * 1000);
+	}
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	printf("[sendbig] done (%d x %d bytes)\n", count, nbytes);
+	return 0;
+}
+
 /* Connected-mode receiver: clone, connect to a specific peer, then blocking-read
  * one datagram -- the connected path returns the bare payload (NO src prefix,
  * and only datagrams from the bound peer are delivered). */
@@ -480,8 +511,9 @@ int main(int argc, char **argv)
 	int crecv = arg2 && strcmp(arg2, "--crecv") == 0;
 	int iso = arg2 && strcmp(arg2, "--iso") == 0;
 	int sendn = arg2 && strcmp(arg2, "--sendn") == 0;
+	int sendbig = arg2 && strcmp(arg2, "--sendbig") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn || sendbig) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -509,6 +541,10 @@ int main(int argc, char **argv)
 	if (sendn) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --sendn <peer> <count> [gap_ms]\n", argv[0]); return 2; }
 		return do_sendn(argv[3], atoi(argv[4]), argc > 5 ? atoi(argv[5]) : 1500);
+	}
+	if (sendbig) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --sendbig <peer> <nbytes> [count] [gap_ms]\n", argv[0]); return 2; }
+		return do_sendbig(argv[3], atoi(argv[4]), argc > 5 ? atoi(argv[5]) : 1, argc > 6 ? atoi(argv[6]) : 1500);
 	}
 	if (concurrent) {
 		return demo_concurrent();
