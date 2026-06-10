@@ -29,6 +29,7 @@
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/session_pool_uart.h>
 #include <zephyr/9p/session_pool_l2cap.h>
+#include <zephyr/9p/gatt_9pis.h>
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/union_fs.h>
 #include <zephyr/9p/remote_fs.h>
@@ -1181,12 +1182,43 @@ static int fw_9p_init(void)
 
 /* ---- BLE bring-up ---- */
 
+/* Advertising data. The 9PIS service UUID (39500001-feed-4a91-ba88-a1e0f6e4c001,
+ * little-endian) is what 9P-over-L2CAP clients filter on; the name is
+ * informational. All carried in the EXTENDED adv AD (> the 31-byte legacy limit),
+ * not a scan response. */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-};
-static const struct bt_data sd[] = {
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+		0x01, 0xc0, 0xe4, 0xf6, 0xe0, 0xa1, 0x88, 0xba,
+		0x91, 0x4a, 0xed, 0xfe, 0x01, 0x00, 0x50, 0x39),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+
+static struct bt_le_ext_adv *adv;
+
+/* Connectable extended advertising. Created once; (re)started on boot and after
+ * each disconnect (connectable adv stops itself on connect). */
+static int adv_start(void)
+{
+	struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
+		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_EXT_ADV,
+		BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL);
+	int err;
+
+	if (!adv) {
+		err = bt_le_ext_adv_create(&param, NULL, &adv);
+		if (err) {
+			LOG_ERR("ext adv create: %d", err);
+			return err;
+		}
+		err = bt_le_ext_adv_set_data(adv, ad, ARRAY_SIZE(ad), NULL, 0);
+		if (err) {
+			LOG_ERR("ext adv set data: %d", err);
+			return err;
+		}
+	}
+	return bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
+}
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -1200,9 +1232,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("BLE disconnected (0x%02x), re-advertising", reason);
-	bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
-					BT_GAP_ADV_FAST_INT_MAX_2, NULL),
-			ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	(void)adv_start();
 }
 
 BT_CONN_CB_DEFINE(conn_cbs) = {
@@ -1261,9 +1291,24 @@ int main(void)
 		LOG_ERR("bt_enable failed: %d", err);
 		return 0;
 	}
-	err = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2,
-					      BT_GAP_ADV_FAST_INT_MAX_2, NULL),
-			      ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	/* 9P Information Service: clients filter on its UUID (advertised) and read
+	 * the PSM/MTU/features from its chars to connect with zero config. Register
+	 * after bt_enable(), before advertising. transport_info MUST carry the real
+	 * PSM (128 = 0x0080) and MTU. Chars are read-only, no auth/pairing. */
+	struct ninep_9pis_config gatt_cfg = {
+		.service_description = "DECTstrous Aether gateway (DECT NR+ / 9P /net/aether)",
+		.service_features    = "net/aether,reliable-datagram,announce",
+		.transport_info      = "l2cap:psm=128,mtu=4096,dynamic,sessions=1",
+		.app_store_link      = "https://github.com/jrsharp/dect",
+		.protocol_version    = "9P2000;aetherd;1.0.0",
+	};
+	err = ninep_9pis_init(&gatt_cfg);
+	if (err) {
+		LOG_ERR("9PIS GATT init: %d (clients can't auto-discover the PSM)", err);
+	}
+
+	err = adv_start();
 	if (err) {
 		LOG_ERR("advertising failed: %d", err);
 		return 0;
