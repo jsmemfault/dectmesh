@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
+#include <sys/time.h>
 #include <signal.h>
 
 enum {
@@ -412,16 +413,26 @@ static int do_sendbig(const char *peer, int nbytes, int count, int gap_ms)
 	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); do_clunk(1); do_clunk(0); return 1; }
 	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
 	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	/* The K_DATA 9P write blocks in aether_mesh_send_reliable until the datagram
+	 * is ACKed (or fails after retries), so with gap_ms=0 the loop is naturally
+	 * stop-and-wait paced and its wall time IS the delivery time -> throughput. */
+	struct timeval t0, t1;
+	int ok = 0;
+	gettimeofday(&t0, NULL);
 	for (int k = 0; k < count && !g_stop; k++) {
 		for (int i = 0; i < nbytes; i++) payload[i] = 'A' + (i % 26);
 		int hl = snprintf((char *)payload, nbytes, "b%03d-", k);
 		if (hl > 0 && hl < nbytes) payload[hl] = 'A';   /* undo snprintf's NUL */
 		if (do_write(2, payload, nbytes) < 0) fprintf(stderr, "[sendbig] write %d failed\n", k);
-		else printf("[SENTBIG] %d : %d bytes\n", k, nbytes);
+		else { ok++; printf("[SENTBIG] %d : %d bytes\n", k, nbytes); }
 		if (gap_ms > 0) usleep((useconds_t)gap_ms * 1000);
 	}
+	gettimeofday(&t1, NULL);
 	do_clunk(2); do_clunk(1); do_clunk(0);
-	printf("[sendbig] done (%d x %d bytes)\n", count, nbytes);
+	double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0;
+	double bps = ms > 0 ? ok * (double)nbytes * 1000.0 / ms : 0;
+	printf("[sendbig] %d/%d x %d B in %.0f ms = %.0f B/s (%.1f kbit/s), %.1f ms/datagram\n",
+	       ok, count, nbytes, ms, bps, bps * 8 / 1000.0, ok ? ms / ok : 0);
 	return 0;
 }
 
