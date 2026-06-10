@@ -436,8 +436,38 @@ static int do_sendbig(const char *peer, int nbytes, int count, int gap_ms)
 	return 0;
 }
 
-/* Connected-mode receiver: clone, connect to a specific peer, then blocking-read
- * one datagram -- the connected path returns the bare payload (NO src prefix,
+/* Parse "aa:bb:cc:dd:ee:ff" -> 6 bytes. */
+static int parse6(const char *s, uint8_t out[6])
+{
+	unsigned int b[6];
+	if (sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return -1;
+	for (int i = 0; i < 6; i++) out[i] = (uint8_t)b[i];
+	return 0;
+}
+
+/* Announced-mode sender: clone, ANNOUNCE, then write [dst(6)][payload] -- exercises
+ * the announced-write (destination-prefixed) reply path (spec §4/§8), i.e. a 9P
+ * server replying to a requester. */
+static int do_asend(const char *dstaddr, const char *msg)
+{
+	uint8_t rb[64];
+	static uint8_t out[6 + 512];
+	if (parse6(dstaddr, out) < 0) { fprintf(stderr, "bad dst addr\n"); return 1; }
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	if (do_write(1, "announce", 8) < 0) { fprintf(stderr, "announce failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	int ml = (int)strlen(msg); if (ml > 512) ml = 512;
+	memcpy(out + 6, msg, ml);
+	if (do_write(2, out, 6 + ml) < 0) fprintf(stderr, "[asend] write failed\n");
+	else printf("[ASEND] announced-write to %s, %d-byte payload: %s\n", dstaddr, ml, msg);
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	return 0;
+}
+
+/* one datagram -- the connected path returns the bare payload (NO src prefix,
  * and only datagrams from the bound peer are delivered). */
 static int do_crecv(const char *peer)
 {
@@ -523,8 +553,9 @@ int main(int argc, char **argv)
 	int iso = arg2 && strcmp(arg2, "--iso") == 0;
 	int sendn = arg2 && strcmp(arg2, "--sendn") == 0;
 	int sendbig = arg2 && strcmp(arg2, "--sendbig") == 0;
+	int asend = arg2 && strcmp(arg2, "--asend") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn || sendbig) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn || sendbig || asend) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -556,6 +587,10 @@ int main(int argc, char **argv)
 	if (sendbig) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --sendbig <peer> <nbytes> [count] [gap_ms]\n", argv[0]); return 2; }
 		return do_sendbig(argv[3], atoi(argv[4]), argc > 5 ? atoi(argv[5]) : 1, argc > 6 ? atoi(argv[6]) : 1500);
+	}
+	if (asend) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --asend <dst_addr> <payload>\n", argv[0]); return 2; }
+		return do_asend(argv[3], argv[4]);
 	}
 	if (concurrent) {
 		return demo_concurrent();
