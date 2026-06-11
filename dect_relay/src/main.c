@@ -1183,41 +1183,38 @@ static int fw_9p_init(void)
 /* ---- BLE bring-up ---- */
 
 /* Advertising data. The 9PIS service UUID (39500001-feed-4a91-ba88-a1e0f6e4c001,
- * little-endian) is what 9P-over-L2CAP clients filter on; the name is
- * informational. All carried in the EXTENDED adv AD (> the 31-byte legacy limit),
- * not a scan response. */
+ * little-endian) is what 9P-over-L2CAP clients filter on. Flags (3 B) + the
+ * 128-bit UUID (18 B) = 21 B, well within the 31-byte LEGACY AD limit, so we use
+ * plain legacy connectable advertising -- NO extended adv, hence no net-core
+ * controller change to deploy (this rides the app-core dev/fw5340 OTA). iOS
+ * CoreBluetooth and the 9p4z l2cap_client both discover legacy adv fine; the
+ * earlier "iOS requires extended advertising" guidance in the brief was wrong.
+ * The name is informational and goes in the scan response (keeps the AD lean). */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
 		0x01, 0xc0, 0xe4, 0xf6, 0xe0, 0xa1, 0x88, 0xba,
 		0x91, 0x4a, 0xed, 0xfe, 0x01, 0x00, 0x50, 0x39),
+};
+
+static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-static struct bt_le_ext_adv *adv;
-
-/* Connectable extended advertising. Created once; (re)started on boot and after
- * each disconnect (connectable adv stops itself on connect). */
+/* Legacy connectable advertising. (Re)started on boot and after each disconnect
+ * (connectable adv stops itself on connect). bt_le_adv_start re-creates the set
+ * each call, so it is safe to call again from the disconnect handler. */
 static int adv_start(void)
 {
+	/* Fast-discovery interval: 30-60 ms (FAST_INT_1), the snappier of the two
+	 * "fast" presets -- ~3x the advertising events of FAST_INT_2 (100-150 ms) for
+	 * quicker pickup by scanning 9P-over-L2CAP clients. Below ~30 ms mostly costs
+	 * power/channel congestion for little latency gain. */
 	struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_EXT_ADV,
-		BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL);
-	int err;
+		BT_LE_ADV_OPT_CONN,
+		BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL);
 
-	if (!adv) {
-		err = bt_le_ext_adv_create(&param, NULL, &adv);
-		if (err) {
-			LOG_ERR("ext adv create: %d", err);
-			return err;
-		}
-		err = bt_le_ext_adv_set_data(adv, ad, ARRAY_SIZE(ad), NULL, 0);
-		if (err) {
-			LOG_ERR("ext adv set data: %d", err);
-			return err;
-		}
-	}
-	return bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
+	return bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
