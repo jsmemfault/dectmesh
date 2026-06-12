@@ -1,10 +1,16 @@
 # Demo video script — self-organizing NR+ mesh (~80 seconds)
 
-*Companion asset to the NR+ mesh pitch — [your name]*
+*Companion asset to the NR+ mesh pitch — Jon Sharp*
 
-**Goal:** in ~80 seconds, make one thing undeniable — *identical firmware on three Nordic radios
-forms a multi-hop mesh by itself, and heals itself when you kill the root.* The self-heal is the
-money shot; everything before it earns the right to show it.
+**Goal:** in ~80 seconds, make one thing undeniable — *identical firmware on Nordic radios forms a
+network by itself, and heals itself when you kill the root.* The self-heal is the money shot;
+everything before it earns the right to show it.
+
+> **Hardware-honesty note.** What's proven on the bench today is **two nodes** (self-organization,
+> self-heal by re-election, reliable chat). This script is written for the **three-node** target
+> because a third node makes the self-heal *visibly* a mesh — a relay in the middle, a tree that
+> re-forms — not just succession. **Shoot the two-node cut now** (see Cut-downs); upgrade to three the
+> moment you have the third board on the bench. Don't film three nodes until the three-node run is real.
 
 **Setup on camera:** three boards on the bench, clearly labeled (e.g., **ROOT / N2 / N3**), each with
 its own large-font terminal tiled on screen. All three running the self-healing build. Keep it
@@ -20,7 +26,7 @@ one-take and unedited where you can — the credibility *is* that it's real.
 | 4 | 0:44–1:08 | "Now the important part." **Physically pull power on the ROOT board.** Cut to N2/N3 terminals; let the logs scroll: `parent 0000 silent, orphaned — relinquishing to re-elect`. Small caption: *(~15 s, unedited)*. A new `0000 ROOT` appears on a surviving node; the other rejoins. | "Now I kill the root. No intervention from me… they notice it's gone, re-elect a new root, and re-form the tree — by themselves." |
 | 5 | 1:08–1:20 | `aether tree` again: new flat tree, different root. Then end card. | "Pull any node — including the root — and the network repairs itself. Same stack runs on my LoRa radios *and* DECT NR+; the routing layer didn't change. This is the open, Zephyr-native mesh NR+ doesn't have yet." |
 
-**End card (hold 3 s):** project name · `github.com/jrsharp/aephyr` (MIT) · "Built on Dean Hall's HeyMac" · your name/contact.
+**End card (hold 3 s):** `github.com/jrsharp/aephyr` (MIT) · "Built on Dean Hall's HeyMac" · Jon Sharp · jon.sharp@memfault.com.
 
 ---
 
@@ -38,6 +44,11 @@ one-take and unedited where you can — the credibility *is* that it's real.
   system is the argument.
 
 ## Cut-downs
+- **Two-node version (shoot today — this is the proven setup):** ROOT + N2 only. Beat 2 shows a
+  two-node tree (`0000 ROOT`, `1000`); beat 3 is chat between them; beat 4 you pull the ROOT and N2
+  **re-elects itself** and keeps the chat alive; beat 5 shows the new single-node-then-rejoining tree.
+  Narrate it honestly — "kill the root, the survivor takes over" — it's a real self-heal, just not yet a
+  visible multi-hop one. Add the third node and the relay/tree-reform story upgrades for free.
 - **60 s:** drop beat 3 (chat) and go straight from "it self-organized" to "watch it heal."
 - **15 s teaser (for chat/Slack/social):** beats 4→5 only — kill the root, show the heal, end card.
   This is the clip that travels.

@@ -1,6 +1,6 @@
 # An open-source mesh stack for Nordic's non-cellular radios
 
-*Internal proposal — [your name], nRF Cloud · [date]*
+*Internal proposal — Jon Sharp, nRF Cloud · June 2026*
 
 **One line:** Nordic ships world-class non-cellular PHYs (DECT NR+ today, sub-GHz NR+ next) but no
 open, Zephyr-native, multi-hop mesh to run on them. I've built one — a self-organizing mesh in which
@@ -17,10 +17,17 @@ That's friction at the exact moment we're trying to grow NR+ adoption — and it
 Nordic already wins with open stacks everywhere else (OpenThread, Matter, Bluetooth mesh).
 
 ## What I've built — and proven on hardware
-Two pillars, running on **nRF9151s** on the **US DECT band (1920–1930 MHz, §15.323)**, all on
-**identical firmware**, built directly on the DECT NR+ **PHY API**.
+Two pillars, running on **nRF9151s** in US NR+ spectrum — demonstrated on the **1920–1930 MHz UPCS
+band (§15.323)** where the work began, and now on the **915 MHz sub-GHz band (R&D evaluation)** — all on **identical
+firmware**, built directly on the DECT NR+ **PHY API**. (The same stack running on both bands is
+itself the portability point, and a head start on the sub-GHz NR+ roadmap below.)
 
-**Pillar 1 — a self-organizing multi-hop mesh.**
+*Honest scope of the hardware proof: demonstrated today on a **two-node bench** — self-organization,
+self-heal by re-election, reliable acknowledged transport, and the full 9P fabric below. The routing
+layer (HONR16, stateless-tree) is **built for multi-hop**; standing up a three-node relay topology is
+the immediate next bench milestone, not a redesign.*
+
+**Pillar 1 — a self-organizing mesh.**
 - **Zero-config:** runtime root election, shallowest-parent join, and **root-loss self-healing** —
   pull any node, including the root, and the network re-forms itself. No roles to provision.
 - **Stateless tree routing (HONR16):** addresses encode topology; forwarding is arithmetic — no route
@@ -47,9 +54,10 @@ per-feature protocol, no SDK per metric. Demonstrated end-to-end on hardware:
 MAC logic moved to DECT NR+ **essentially unchanged.** That's evidence the abstraction sits at the
 right layer — and it pre-fits the **sub-GHz NR+** part on the roadmap.
 
-Code is a clean, MIT-licensed Zephyr module. 3-minute demo video: [link].
+Code is a clean, MIT-licensed Zephyr module. 3-minute demo video (script ready — recording next): [link].
 
-> **See it in 3 minutes.** (1) Pull the root node → the mesh re-forms itself. (2) `cat` a node's live
+> **See it in 3 minutes.** (1) Pull the root node → a surviving node re-elects itself and the network
+> re-forms. (2) `cat` a node's live
 > state from a laptop over BLE. (3) Update a USB-less radio's firmware by *writing a file*. Self-healing,
 > everything-is-a-file, and OTA-as-`cp` — on real hardware, identical firmware on every node.
 

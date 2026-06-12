@@ -1,6 +1,6 @@
 # How I'd lead it: an open NR+ mesh effort at Nordic
 
-*Companion to "An open-source mesh stack for Nordic's non-cellular radios" — [your name] · [date]*
+*Companion to "An open-source mesh stack for Nordic's non-cellular radios" — Jon Sharp · June 2026*
 
 **The role in one line:** Technical lead for an open, Zephyr-native NR+ mesh stack — *and* Nordic's
 developer-ecosystem voice for non-cellular mesh. One person who both **builds the thing** and **grows
