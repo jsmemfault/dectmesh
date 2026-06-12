@@ -1060,19 +1060,20 @@ static int fw_9p_init(void)
 	/* Per-node qid salt from the 5340 device id: two relays running this same
 	 * firmware otherwise present IDENTICAL (path-derived) qids, and a host that
 	 * 9pfuse-mounts both at once aliases the two volumes in its qid-keyed inode
-	 * cache. Salting with the unique device id makes each node's qids distinct. */
+	 * cache. Salting with the unique device id makes each node's qids distinct.
+	 * Applied to BOTH the sysfs tree here and the /net/aether remote_fs below. */
+	uint64_t qid_salt = 0;
 	{
 		uint8_t devid[8];
 		ssize_t dn = hwinfo_get_device_id(devid, sizeof(devid));
-		uint64_t salt = 0;
 
 		for (ssize_t i = 0; i < dn; i++) {
-			salt = (salt << 8) | devid[i];
+			qid_salt = (qid_salt << 8) | devid[i];
 		}
-		if (salt != 0) {
-			ninep_sysfs_set_qid_salt(&fw_sysfs, salt);
-			LOG_INF("sysfs qid salt = %08x%08x",
-				(uint32_t)(salt >> 32), (uint32_t)salt);
+		if (qid_salt != 0) {
+			ninep_sysfs_set_qid_salt(&fw_sysfs, qid_salt);
+			LOG_INF("qid salt = %08x%08x",
+				(uint32_t)(qid_salt >> 32), (uint32_t)qid_salt);
 		}
 	}
 	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/reboot",
@@ -1147,6 +1148,13 @@ static int fw_9p_init(void)
 	if (err) {
 		LOG_ERR("/net/aether remote_fs init: %d", err);
 		return err;
+	}
+	/* Same per-node salt as the sysfs tree: gives /net/aether unique, non-zero
+	 * qids (the proxy root was hardcoded 0 + failed get_qid left entries at 0,
+	 * which aliased inodes and broke FUSE navigation), and distinct across two
+	 * mounted nodes. */
+	if (qid_salt != 0) {
+		ninep_remote_fs_set_qid_salt(&aether_rfs, qid_salt);
 	}
 	err = ninep_union_fs_init(&fw_union, fw_union_mounts,
 				  ARRAY_SIZE(fw_union_mounts));
