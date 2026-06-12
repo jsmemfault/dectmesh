@@ -18,6 +18,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -1055,6 +1056,24 @@ static int fw_9p_init(void)
 	if (err) {
 		LOG_ERR("fw sysfs init: %d", err);
 		return err;
+	}
+	/* Per-node qid salt from the 5340 device id: two relays running this same
+	 * firmware otherwise present IDENTICAL (path-derived) qids, and a host that
+	 * 9pfuse-mounts both at once aliases the two volumes in its qid-keyed inode
+	 * cache. Salting with the unique device id makes each node's qids distinct. */
+	{
+		uint8_t devid[8];
+		ssize_t dn = hwinfo_get_device_id(devid, sizeof(devid));
+		uint64_t salt = 0;
+
+		for (ssize_t i = 0; i < dn; i++) {
+			salt = (salt << 8) | devid[i];
+		}
+		if (salt != 0) {
+			ninep_sysfs_set_qid_salt(&fw_sysfs, salt);
+			LOG_INF("sysfs qid salt = %08x%08x",
+				(uint32_t)(salt >> 32), (uint32_t)salt);
+		}
 	}
 	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/reboot",
 						 NULL, fw_write_reboot, NULL);
