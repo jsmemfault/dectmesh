@@ -35,11 +35,20 @@ echo "mount  : $MNT"
 sleep 2
 
 if mount | grep -q "$MNT"; then
-	echo "opening Finder at $MNT"
-	open "$MNT"
+	# Keep Spotlight off the mount -- otherwise mds_stores readdir's/stats the
+	# whole volume in the background (incl. net/), storming the proxy + CDC.
+	mdutil -i off "$MNT"        >/dev/null 2>&1 || true
+	mdutil -d "$MNT"            >/dev/null 2>&1 || true   # disable indexing store
+	# Open Finder at the STATIC dev/ subtree, never the root: a root readdir
+	# enumerates net/ (the /net/aether clone-proxy) which hangs FUSE.
+	echo "opening Finder at $MNT/dev"
+	open "$MNT/dev"
 	echo
-	echo "mounted. try:  ls $MNT/dev/aether   cat $MNT/dev/aether/addr"
-	echo "clean up with: umount $MNT ; pkill -f 'socat.*$SOCK'"
+	echo "NOTE: run this from a real Terminal.app/iTerm session -- the background"
+	echo "      socat + 9pfuse must outlive the script, which they do NOT under"
+	echo "      Claude Code's ! prefix (those get reaped on return)."
+	echo "reliable browse:  ls $MNT/dev/aether ; cat $MNT/dev/aether/addr"
+	echo "clean up with:    umount $MNT ; pkill -f 'socat.*$SOCK'"
 else
 	echo "mount failed -- check 9pfuse/macFUSE and that the node is responsive"
 	pkill -f "socat.*$SOCK" 2>/dev/null
