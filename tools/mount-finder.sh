@@ -30,8 +30,8 @@ echo "bridge : $PORT  ->  $SOCK"
 socat UNIX-LISTEN:"$SOCK",fork "$PORT",rawer &
 sleep 2
 
-echo "mount  : $MNT"
-"$FUSE" "unix!$SOCK" "$MNT" &
+echo "mount  : $MNT  (-A 60: cache lookups+attrs 60s to quiet the macOS storm)"
+"$FUSE" -A 60 "unix!$SOCK" "$MNT" &
 sleep 2
 
 if mount | grep -q "$MNT"; then
