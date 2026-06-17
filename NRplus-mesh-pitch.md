@@ -16,6 +16,12 @@ open-source, Zephyr-native, self-organizing multi-hop mesh** a developer can pic
 That's friction at the exact moment we're trying to grow NR+ adoption — and it's a category where
 Nordic already wins with open stacks everywhere else (OpenThread, Matter, Bluetooth mesh).
 
+**Prior art:** the closest open effort — the Opener Initiative's Apache-2.0 DECT NR+ stack (UPCT/Ostfalia,
+EU MERCI project) — nails the **ETSI MAC framing and FT/PT association** but stops at a **single-hop star
+with static roles**; its one mesh primitive is declared in the headers and never implemented. The
+spec-conformant framing is the published, mechanical part — **the self-organizing multi-hop mesh on top is
+the gap, and it's what I've built.**
+
 ## What I've built — and proven on hardware
 Two pillars, running on **nRF9151s** in US NR+ spectrum — demonstrated on the **1920–1930 MHz UPCS
 band (§15.323)** where the work began, and now on the **915 MHz sub-GHz band (R&D evaluation)** — all on **identical
