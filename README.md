@@ -54,7 +54,7 @@ for control. Here they are one namespace:
 ```sh
 9p read  /dev/aether/neighbors      # live mesh state
 9p ls    /net/aether                # datagram service: clone · status · addr
-9p write /dev/fw9151 < image.signed.bin   # firmware update (stream via aether_conv --put; doc/OTA.md)
+9p write /dev/fw9151 < image.signed.bin   # firmware update (just a file write; doc/OTA.md)
 9p read  /dev/link9151              # link health
 9p write /dev/reboot9151            # control
 ```
@@ -77,10 +77,10 @@ subtree; it's the same three lines.
 > mcumgr, no bespoke transfer code — and the same `write` updates the local chip
 > (`/dev/fw5340`) and the remote chip (`/dev/fw9151`) identically.
 >
-> In practice you stream that file in paced 1 KB chunks with `tools/aether_conv --put`
-> (the 1 Mbps inter-chip UART can't take a raw `9p write` burst) — same file, same
-> semantics, just flow-controlled. **Full step-by-step recipe + the one gotcha that
-> matters: [`doc/OTA.md`](doc/OTA.md).**
+> A plain `9p write` does it — the relay rate-matches the two transports internally
+> (it paces the raw inter-chip UART so the host never has to), so there's no client-side
+> chunking or throttling. **Full step-by-step recipe + verification:
+> [`doc/OTA.md`](doc/OTA.md).**
 
 **3. Transport-agnostic — the radio becomes a mount point.** The same 9P runs over UART,
 USB-CDC, BLE L2CAP, TCP, and across the DECT mesh. Swap the transport; the semantics
@@ -104,13 +104,14 @@ model** rather than features you have to write. That's the multiplier.
 9p -a unix!/tmp/9p.sock ls /dev                 # the control surface
 9p -a unix!/tmp/9p.sock read  /dev/link9151      # link: up · relinks · last_contact
 9p -a unix!/tmp/9p.sock read  /dev/fw9151        # the 9151's running/pending version
-9p -a unix!/tmp/9p.sock write /dev/reboot9151    # control (e.g. trigger a swap after an OTA)
+9p -a unix!/tmp/9p.sock write /dev/fw9151 < dect_mesh/build_thingy/dect_mesh/zephyr/zephyr.signed.bin  # OTA
+9p -a unix!/tmp/9p.sock write /dev/reboot9151    # → swap → relay auto-confirms if healthy
 ```
 
-> **Firmware OTA is a file write too** — but the image must be *streamed* with
-> `tools/aether_conv --put` (paced 1 KB chunks), **not** `9p write` (its bursts overrun the
-> inter-chip UART and truncate the image). The full reliable recipe — and the
-> read-before-write gotcha that wedges it — is in **[`doc/OTA.md`](doc/OTA.md)**.
+> **Firmware OTA is a file write too** — `9p write /dev/fw9151 < image` then
+> `9p write /dev/reboot9151`. The relay paces the raw inter-chip UART internally (it chunks
+> the forward), so a plain `9p write` streams through with no client-side throttling. Full
+> recipe + verification: **[`doc/OTA.md`](doc/OTA.md)**.
 
 Plus an interactive shell on cdc2 (the `*105` port) — `kernel`, `device list`, and the
 full Memfault group (`mflt export`, `mflt get_core`, `mflt get_reboot_reason`, …).
@@ -154,9 +155,8 @@ np() {                                 # np ls /dev   ·   np read /dev/link9151
 np ls   /dev                                          # the control surface
 np read /dev/link9151                                 # link health
 np read /dev/fw9151                                   # running / pending version
-echo 1 | np write /dev/reboot9151                     # control: reboot/confirm are fine via np
-# Firmware OTA is the one exception to one-socat-per-op: stream the image with a
-# fid-holding client, tools/aether_conv --put (NOT `np write`). Full recipe: doc/OTA.md
+np write /dev/fw9151 < dect_mesh/build_thingy/dect_mesh/zephyr/zephyr.signed.bin   # OTA (relay paces the link)
+echo 1 | np write /dev/reboot9151                     # → swap → relay auto-confirms if healthy
 ```
 
 **Gotchas:** the `,rawer` on the socat address matters (no tty line-discipline mangling the 9P
@@ -192,7 +192,7 @@ It validates the full path: `clone` allocates conversation N, holding the ctl fi
 | **`dect_mesh/`** | nRF9151 app (*DECTstrous Mesh*): Æther/HONR mesh on the DECT NR+ PHY + the `/net/aether` & `/dev/firmware` 9P server + Memfault |
 | **`dect_relay/`** | nRF5340 app (*DECTstrous Relay*): the 9P aggregator — USB-CDC 9P server, 9P client to the 9151, OTA/self-heal/auto-confirm, shell |
 | **`flash-thingy.sh`** | One-time J-Link bring-up of a new node (`relay` / `mesh`); after this, nodes update over USB/OTA |
-| **`doc/OTA.md`** | **Firmware OTA over 9P** — the headline "update = a file write" capability: value prop, the reliable `aether_conv --put` recipe, and the gotchas |
+| **`doc/OTA.md`** | **Firmware OTA over 9P** — the headline "update = a file write" capability: value prop, the plain-`9p write` recipe (the relay rate-matches the inter-chip UART), verification, and gotchas |
 | **`doc/NET_AETHER_SPEC.md`** | The `/net/aether` datagram-service spec (Plan 9 `/net`-style clone/ctl/data) |
 | **`dectfw/`** | Licensed DECT NR+ PHY modem firmware (access-gated — **never commit**) |
 | **`legacy_flood/`** | The original flood+TTL Memfault example, superseded by `dect_mesh` |
