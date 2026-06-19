@@ -869,17 +869,41 @@ static int fw9151_write(const uint8_t *buf, uint32_t count, uint64_t off, void *
 		}
 		LOG_INF("fw9151: DFU stream started");
 	}
-	ret = ninep_client_write(&mesh_client, fw9151_wfid, fw9151_woff, buf, count);
-	if (ret < 0) {
-		LOG_ERR("fw9151: remote write failed: %d", ret);
-		ninep_client_clunk(&mesh_client, fw9151_wfid);
-		fw9151_writing = false;
-		k_mutex_unlock(&mesh_wr);
-		return ret;
+	/*
+	 * Rate-match the two transports. The host delivers up to a full-msize
+	 * Twrite over flow-controlled USB-CDC; forwarding it WHOLE to the 9151 over
+	 * the raw inter-chip UART (no RTS/CTS) overruns the 9151's RX while it
+	 * stalls writing a flash page during DFU -> dropped bytes -> "write failed"
+	 * (observed: ~4 KB squeaks through, ~8 KB fails). Forward in bounded,
+	 * individually round-tripped sub-writes -- the round-trip is the flow
+	 * control, so the 9151 never sees an oversized burst. The host still issues
+	 * one ordinary `9p write`; the chunking lives here in the bridge.
+	 */
+	uint32_t done = 0;
+
+	while (done < count) {
+		uint32_t n = count - done;
+
+		if (n > CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK) {
+			n = CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK;
+		}
+		ret = ninep_client_write(&mesh_client, fw9151_wfid,
+					 fw9151_woff + done, buf + done, n);
+		if (ret < 0) {
+			LOG_ERR("fw9151: remote write failed: %d", ret);
+			ninep_client_clunk(&mesh_client, fw9151_wfid);
+			fw9151_writing = false;
+			k_mutex_unlock(&mesh_wr);
+			return ret;
+		}
+		done += (uint32_t)ret;
+		if ((uint32_t)ret < n) {
+			break;   /* short write -- stop and report progress */
+		}
 	}
-	fw9151_woff += ret;
+	fw9151_woff += done;
 	k_mutex_unlock(&mesh_wr);
-	return ret;
+	return (int)done;
 }
 
 /* clunk: close the remote fid -> the 9151's ninep_dfu requests its upgrade */
