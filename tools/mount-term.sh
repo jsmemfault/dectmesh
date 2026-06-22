@@ -4,12 +4,19 @@
 # 9pfuse for hand navigation in the TERMINAL (no Finder). The socat + 9pfuse run
 # in the background and OUTLIVE this script, so you keep browsing after it returns.
 #
-#   ./mount-term.sh [/dev/cu.usbmodemXXX3]
+#   ./mount-term.sh [/dev/cu.usbmodemXXX3] [tag]
 #
-# With no arg it grabs the first 9P port (ending in '3'; x1=9151 console, x3=9P,
+# With no PORT it grabs the first 9P port (ending in '3'; x1=9151 console, x3=9P,
 # x5=5340 console). dev/ is the static node tree (fast). net/aether is the clone-
 # proxy: `ls`/`cat` a handful of entries is fine; avoid hammering readdirs (the
 # bursty 9151 proxy can't keep up and the CDC back-pressures).
+#
+# TAG (optional) suffixes the socket + mount point so you can mount MORE THAN ONE
+# node at once without collision. No tag -> /tmp/aether.sock + /tmp/aether. Tag
+# "b" -> /tmp/aetherb.sock + /tmp/aetherb. Each instance tears down only its own
+# socket/mount, so run it once per node:
+#   ./mount-term.sh /dev/cu.usbmodem1203 a
+#   ./mount-term.sh /dev/cu.usbmodem2103 b
 #
 # IMPORTANT: run from a real Terminal.app/iTerm session. Under Claude Code's `!`
 # prefix the backgrounded socat/9pfuse get reaped on return and the mount dies.
@@ -18,13 +25,15 @@ set -u
 
 PORT="${1:-$(ls /dev/cu.usbmodem*3 2>/dev/null | head -1)}"
 [ -n "$PORT" ] || { echo "no 9P port (/dev/cu.usbmodem*3) -- plug a node in"; exit 1; }
+TAG="${2:-}"
 
-SOCK=/tmp/aether.sock
-MNT=/tmp/aether
+SOCK="/tmp/aether${TAG}.sock"
+MNT="/tmp/aether${TAG}"
 FUSE="$HOME/src/plan9port/bin/9pfuse"
 [ -x "$FUSE" ] || { echo "9pfuse not found at $FUSE"; exit 1; }
 
-# tear down any previous session (umount cleanly; never just kill the mount)
+# tear down any previous session for THIS instance (umount cleanly; never just
+# kill the mount). Scoped by $SOCK/$MNT so other tagged mounts are left alone.
 umount "$MNT" 2>/dev/null
 pkill -f "9pfuse.*$MNT" 2>/dev/null
 pkill -f "socat.*$SOCK" 2>/dev/null
