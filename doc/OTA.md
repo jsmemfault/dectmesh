@@ -73,10 +73,21 @@ the fix that fits this SiP.)
 - **Pin the `*3` port; don't glob `*3`** — a connected Nordic DK is a J-Link with a serial
   like `...707993` (ends in `3`, sorts first), so `ls /dev/cu.usbmodem*3 | head -1` grabs
   the DK, not your node.
-- **One bridge per logical operation; don't churn the session.** The relay's 9P session
-  pool is **size 1 and DTR-gated** (open the port → session; close → teardown). Rapidly
-  cycling `socat`/clients can wedge it; if a read or write starts hanging, re-bridge (fresh
-  `socat`) or, worst case, power-cycle the node.
+- **Hold ONE socat bridge for the whole sequence — do NOT cycle it.** This is the single
+  biggest reliability lesson, and it is about the **host / USB-CDC side, not the mesh or 9P**
+  (the 9P stack + the 0.38.17 flow-control fix are robust). Bring up one
+  `socat UNIX-LISTEN:/tmp/9p.sock,fork <port>,rawer`, run *all* ops against it
+  (write → reboot → confirm → any reads), then tear it down **once** at the end. Do **not**
+  `pkill socat; socat …` between operations: every socat open/close toggles **DTR**, which
+  churns the relay's **size-1, DTR-gated session pool** and progressively wedges the USB-CDC
+  peripheral → `operation not permitted` on open, read/write timeouts, `bad rpc tag` desync.
+  These *look* like mesh-load or link failures but are pure local-port abuse — they vanish
+  with a single held bridge (proven: after dozens of failures from cycling, a node OTA'd
+  clean on one held bridge with the mesh fully active). `socat …,fork` keeps the port (and
+  DTR) asserted across multiple client connections, so several `9p`/`p9do` invocations over
+  the *same* bridge are fine; it is **restarting socat** that hurts. Also avoid gratuitous
+  diagnostic reads that add churn around the write. If the relay's session is *already*
+  wedged (reads time out even on a fresh bridge), **power-cycle the node** to reset it.
 - **A failed write latches the 9151 DFU in `state error`.** Clear it with
   `9p write /dev/reboot9151` (or `kernel reboot cold` on the 9151 console `*01` if the 9P
   link is wedged) before retrying. A partial image in the secondary slot is harmless —
