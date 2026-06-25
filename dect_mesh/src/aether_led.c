@@ -122,10 +122,10 @@ static int64_t last_rx_ms;   /* set by led_rx_cb on each received datagram */
 
 /* Mesh recv callback: note the time so the next tick shows the activity flash. */
 static void led_rx_cb(struct net_if *iface, const uint8_t src[6],
-		      const uint8_t *data, size_t len, void *user)
+		      const uint8_t *data, size_t len, bool broadcast, void *user)
 {
 	ARG_UNUSED(iface); ARG_UNUSED(src); ARG_UNUSED(data);
-	ARG_UNUSED(len); ARG_UNUSED(user);
+	ARG_UNUSED(len); ARG_UNUSED(broadcast); ARG_UNUSED(user);
 	last_rx_ms = k_uptime_get();
 }
 

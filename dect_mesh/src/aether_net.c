@@ -50,7 +50,8 @@ struct aether_dgram {
 	uint8_t data[AETHER_MAX_MSG];
 };
 
-enum conv_state { CONV_UNCONNECTED = 0, CONV_CONNECTED, CONV_ANNOUNCED };
+/* CONV_BCAST: spec §6a best-effort broadcast party line (connect ff:ff:ff:ff:ff:ff). */
+enum conv_state { CONV_UNCONNECTED = 0, CONV_CONNECTED, CONV_ANNOUNCED, CONV_BCAST };
 
 /* node "kind" so an fs_ops callback can dispatch from the bare node. Stored in
  * ninep_fs_node.data. */
@@ -225,7 +226,8 @@ static void conv_free(struct aether_conv *c)
 /* ---- mesh receive: fan a datagram out to matching conversations ---- */
 
 static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
-			   const uint8_t *payload, size_t len, void *user)
+			   const uint8_t *payload, size_t len, bool broadcast,
+			   void *user)
 {
 	ARG_UNUSED(iface);
 	ARG_UNUSED(user);
@@ -242,8 +244,12 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 		if (!c->in_use) {
 			continue;
 		}
-		bool take = (c->state == CONV_ANNOUNCED) ||
-			    (c->state == CONV_CONNECTED && memcmp(c->peer, src, 6) == 0);
+		/* §6a: broadcasts fan into every party-line conv; unicast goes to
+		 * announced (any peer) or a connected conv bound to this src. */
+		bool take = broadcast
+			    ? (c->state == CONV_BCAST)
+			    : (c->state == CONV_ANNOUNCED ||
+			       (c->state == CONV_CONNECTED && memcmp(c->peer, src, 6) == 0));
 		if (!take) {
 			continue;
 		}
@@ -272,6 +278,14 @@ static int ctl_exec(struct aether_conv *c, const char *cmd)
 		}
 		if (parse_addr(cmd + 8, a) < 0) {
 			return -EINVAL;
+		}
+		/* §6a: connect to the all-ones address marks a best-effort broadcast
+		 * party line, not a unicast bind. */
+		static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+		if (memcmp(a, bcast, 6) == 0) {
+			c->state = CONV_BCAST;
+			return 0;
 		}
 		memcpy(c->peer, a, 6);
 		c->state = CONV_CONNECTED;
@@ -440,6 +454,8 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 			n = snprintf(s, sizeof(s), "connected aether!%s reliable\n", a);
 		} else if (c && c->state == CONV_ANNOUNCED) {
 			n = snprintf(s, sizeof(s), "announced\n");
+		} else if (c && c->state == CONV_BCAST) {
+			n = snprintf(s, sizeof(s), "broadcast best-effort\n");  /* §6a */
 		} else {
 			n = snprintf(s, sizeof(s), "unconnected\n");
 		}
@@ -457,14 +473,16 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		if (d.len == 0) {
 			return 0;   /* hangup sentinel -> EOF */
 		}
-		uint32_t need = d.len + (c->state == CONV_ANNOUNCED ? 6 : 0);
+		/* §6a broadcast reads are source-prefixed, same shape as announced. */
+		bool src_prefixed = (c->state == CONV_ANNOUNCED || c->state == CONV_BCAST);
+		uint32_t need = d.len + (src_prefixed ? 6 : 0);
 
 		if (count < need) {
 			return -EMSGSIZE;
 		}
 		uint32_t k = 0;
 
-		if (c->state == CONV_ANNOUNCED) {
+		if (src_prefixed) {
 			memcpy(buf, d.src, 6);
 			k = 6;
 		}
@@ -515,6 +533,25 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 
 		if (!c) {
 			return -ENOTCONN;
+		}
+		if (c->state == CONV_BCAST) {
+			/* §6a: best-effort broadcast -- no ARQ, no fragmentation, no dst
+			 * prefix; one PHY frame max (a larger write -> -EMSGSIZE). The
+			 * mesh layer floods it (TTL+dedup) for multi-hop reach. */
+			static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+			if (count > CONFIG_AETHER_MAX_PAYLOAD) {
+				return -EMSGSIZE;
+			}
+			int ret = aether_mesh_send(g_fs.iface, bcast, buf, count,
+						   AETHER_PRIORITY_NORMAL);
+			if (ret < 0) {
+				g_fs.ctr.tx_err++;
+				return ret;
+			}
+			g_fs.ctr.tx++;
+			g_fs.ctr.tx_bytes += count;
+			return (int)count;
 		}
 		if (c->state == CONV_CONNECTED) {
 			/* connected: bare payload -> the bound peer (spec §4). */

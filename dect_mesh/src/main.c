@@ -50,10 +50,15 @@ static const uint8_t aether_bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
  * regardless of which shell instance (if any) issued a command.
  */
 static void chat_recv_cb(struct net_if *iface, const uint8_t src[6],
-			 const uint8_t *data, size_t len, void *user_data)
+			 const uint8_t *data, size_t len, bool broadcast, void *user_data)
 {
 	ARG_UNUSED(iface);
 	ARG_UNUSED(user_data);
+
+	/* The party line is broadcast-only; a unicast datagram is not chat. */
+	if (!broadcast) {
+		return;
+	}
 
 	/* Identify the talker by the last two address bytes. */
 	printk("\n<chat %02x:%02x> %.*s\n", src[4], src[5], (int)len, (const char *)data);
