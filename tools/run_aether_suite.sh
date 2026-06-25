@@ -44,8 +44,13 @@ cc -O2 -o "$AT" "$HERE/aether_test.c" || { echo "build aether_test failed"; exit
 cc -O2 -o "$P9" "$HERE/p9do.c"        || { echo "build p9do failed"; exit 2; }
 
 # --- ports + socats --------------------------------------------------------
-PORTS=($(ls /dev/cu.usbmodem*3 2>/dev/null))
-[ "${#PORTS[@]}" -ge 2 ] || { echo "need two thingy 9P ports (found ${#PORTS[@]})"; exit 2; }
+# Thingy relay 9P data port is the CDC suffix "...03" (01=9151 console, 03=9P,
+# 05=5340 console). Match "*03" specifically so a co-connected nRF9151 DK (whose
+# J-Link CDC enumerates as a long serial ...991/...993) is NOT mistaken for a 9P
+# port -- the DK is a third mesh node now, not a suite endpoint. Override with
+# PORTS="/dev/cu.A /dev/cu.B" to pick explicitly.
+PORTS=(${PORTS:-$(ls /dev/cu.usbmodem*03 2>/dev/null)})
+[ "${#PORTS[@]}" -ge 2 ] || { echo "need two thingy 9P ports (found ${#PORTS[@]}); set PORTS=... to override"; exit 2; }
 pkill -f 'socat.*usbmodem' 2>/dev/null; sleep 2; rm -f "$SA" "$SB"
 socat UNIX-LISTEN:"$SA",fork "${PORTS[0]}",rawer & socat UNIX-LISTEN:"$SB",fork "${PORTS[1]}",rawer & sleep 3
 trap 'pkill -f "socat.*usbmodem" 2>/dev/null' EXIT
@@ -180,6 +185,67 @@ for c in $(seq 1 "$SOAK_N"); do
 done
 [ "$soak_fail" = 0 ] && ok "soak: $SOAK_N cycles all 23/23 + status back to 0/4 (no conversation leak over time)" \
   || no "soak: leak/regression over $SOAK_N cycles" "$soak_fail failed check(s)"
+
+# ==========================================================================
+# Phase 4: the new realities (firmware >= 0.7.23). Durable 6-byte identity
+# DECOUPLED from the HONR routing address, and the §6a broadcast party line
+# carrying that identity as src. On older firmware these FAIL by design (the
+# address was the HONR-derived 00:00:00:00:<honr>, mutable and not an identity).
+echo; echo "########## Phase 4: durable identity + §6a broadcast party-line ##########"
+
+# this node's durable identity (net/aether/addr) vs its HONR addr (dev/aether/addr)
+ident(){ "$P9" "$1" rd:net/aether/addr 2>/dev/null | sed -n 's#.*=> ##p' | tr -cd '0-9a-f:'; }
+
+# 4a: identity is a 6-byte locally-administered unicast id, decoupled from HONR
+id_check(){  # <sock> <label>
+  local id b0 hi hn
+  id=$(ident "$1"); settle
+  hn=$(hex4 "$("$P9" "$1" rd:dev/aether/addr 2>/dev/null | sed -n 's#.*=> ##p')"); settle
+  if ! echo "$id" | grep -qE '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'; then
+    no "$2 identity is 6-byte colon-hex" "got '$id'"; return; fi
+  b0=$((16#${id%%:*}))
+  # locally-administered (bit1=1) + unicast (bit0=0)  ->  byte0 & 0x03 == 0x02
+  if [ $(( b0 & 3 )) -ne 2 ]; then
+    no "$2 identity is LAA-unicast" "byte0=$(printf %02x "$b0")"; return; fi
+  # decoupled from HONR: NOT the old 00:00:00:00:<honr> shape (high 4 bytes != 0)
+  hi=$(echo "$id" | cut -d: -f1-4 | tr -cd '0-9a-f')
+  if [ "$hi" = "00000000" ]; then
+    no "$2 identity decoupled from HONR" "HONR-derived shape: $id"; return; fi
+  ok "$2 durable identity $id (LAA-unicast, decoupled from HONR=$hn)"
+}
+settle
+id_check "$A" "node A"
+id_check "$B" "node B"
+
+# 4b: a connect-ff:ff (§6a) receiver sees the SENDER'S DURABLE IDENTITY as src,
+#     not 00:00:00:00:<honr>. B broadcasts; A receives. Best-effort -> retry once.
+bsrc(){  # <recv_sock> <send_sock> <expect-identity> <label>
+  local got="" src
+  for attempt in 1 2; do
+    "$AC" "$1" --brecv 1 > /tmp/_b.log 2>&1 & local rp=$!; sleep 5
+    TRUN_TO=10 trun "$AC" "$2" ff:ff:ff:ff:ff:ff >/dev/null 2>&1
+    sleep 3; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null; settle
+    got=$(grep '\[BRECV\]' /tmp/_b.log | head -1); [ -n "$got" ] && break
+  done
+  if [ -z "$got" ]; then no "$4" "no broadcast received (2 attempts)"; return; fi
+  # match only a full 6-octet address -- the payload ("...from aether_conv") also
+  # contains the word "from", so a loose 'from [0-9a-f:]+' would mis-capture "ae".
+  src=$(echo "$got" | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+  if [ "$src" = "$3" ]; then ok "$4 (src=$src == sender identity)"
+  else no "$4" "src=$src expected sender identity $3"; fi
+}
+idB=$(ident "$B"); settle
+bsrc "$A" "$B" "$idB" "§6a broadcast B->A: src is B's durable identity"
+
+# 4c: own broadcast is NOT echoed back to the originator (identity-keyed own-echo
+#     guard). A holds a §6a receiver AND originates -- it must not see itself.
+idA=$(ident "$A"); settle
+"$AC" "$A" --brecv 1 > /tmp/_e.log 2>&1 & ep=$!; sleep 5
+TRUN_TO=10 trun "$AC" "$A" ff:ff:ff:ff:ff:ff >/dev/null 2>&1
+sleep 3; kill "$ep" 2>/dev/null; wait "$ep" 2>/dev/null; settle
+if grep -q "from $idA" /tmp/_e.log 2>/dev/null; then
+  no "own-echo suppression" "node A received its own broadcast (src=$idA)"
+else ok "own-echo suppression (A did not receive its own broadcast)"; fi
 
 # ==========================================================================
 echo; echo "########## SUMMARY ##########"

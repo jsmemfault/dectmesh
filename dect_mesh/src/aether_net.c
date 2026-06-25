@@ -111,6 +111,16 @@ static int fmt_addr(char *s, size_t sz, const uint8_t a[6])
 			a[0], a[1], a[2], a[3], a[4], a[5]);
 }
 
+/* This node's durable identity (node_eui) -- the address /net/aether exposes.
+ * Read live from the mesh ctx so it reflects the boot identity, NOT the HONR
+ * routing address (which churns with the tree). Falls back to the cached value
+ * if the mesh isn't up yet. */
+extern struct aether_mesh_ctx *g_mesh_ctx;
+static const uint8_t *my_identity(void)
+{
+	return g_mesh_ctx ? g_mesh_ctx->node_eui : g_fs.myaddr;
+}
+
 /* Parse "aa:bb:cc:dd:ee:ff" -> 6 bytes. Returns 0 on success. */
 static int parse_addr(const char *s, uint8_t out[6])
 {
@@ -403,7 +413,7 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 	case K_CONVDIR:
 		return read_dir(node, offset, buf, count);
 	case K_ADDR:
-		n = fmt_addr(s, sizeof(s), g_fs.myaddr);
+		n = fmt_addr(s, sizeof(s), my_identity());
 		s[n++] = '\n';
 		break;
 	case K_TOPSTATUS: {
@@ -435,7 +445,7 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		n = snprintf(s, sizeof(s), "%d\n", c ? c->slot : 0);
 		break;
 	case K_LOCAL:
-		n = fmt_addr(s, sizeof(s), g_fs.myaddr);
+		n = fmt_addr(s, sizeof(s), my_identity());
 		s[n++] = '\n';
 		break;
 	case K_REMOTE:

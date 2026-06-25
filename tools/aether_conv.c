@@ -340,6 +340,36 @@ static int do_hold(void)
 /* Receiver: clone a conversation, ANNOUNCE (receive any datagram, source-
  * prefixed), then blocking-read one datagram and print its source + payload.
  * Pair with a sender (`aether_conv <peer-sock> <this-node-MAC>`). */
+/* §6a broadcast receiver: clone, connect ff:ff:ff:ff:ff:ff (CONV_BCAST), then
+ * hold one session and read up to `count` source-prefixed broadcast datagrams.
+ * Mirrors do_recv but joins the party line instead of announcing -- this is the
+ * exact mode the deck chat client uses, so it isolates the §6a *receive* path. */
+static int do_brecv(int count)
+{
+	uint8_t rb[600];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	if (do_write(1, "connect ff:ff:ff:ff:ff:ff", 25) < 0) { fprintf(stderr, "connect bcast failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); do_clunk(1); do_clunk(0); return 1; }
+	printf("[brecv] conv %d joined party line (connect ff:ff); reading up to %d broadcast(s)...\n", conv, count);
+	for (int k = 0; k < count && !g_stop; k++) {
+		n = do_read(2, 0, rb, sizeof(rb) - 1);
+		if (n < 0) { if (!g_stop) fprintf(stderr, "[brecv] read failed: %d\n", n); break; }
+		if (n == 0) { printf("[brecv] EOF (hangup)\n"); break; }
+		if (n >= 6) {
+			printf("[BRECV] %d bytes from %02x:%02x:%02x:%02x:%02x:%02x : %.*s\n",
+			       n - 6, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], n - 6, (char *)rb + 6);
+		} else {
+			printf("[brecv] %d bytes (no src prefix): %.*s\n", n, n, (char *)rb);
+		}
+	}
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	printf("[brecv] done\n");
+	return 0;
+}
+
 static int do_recv(int count)
 {
 	uint8_t rb[600];
@@ -549,13 +579,14 @@ int main(int argc, char **argv)
 	int concurrent = arg2 && strcmp(arg2, "--concurrent") == 0;
 	int hold = arg2 && strcmp(arg2, "--hold") == 0;
 	int recv = arg2 && strcmp(arg2, "--recv") == 0;
+	int brecv = arg2 && strcmp(arg2, "--brecv") == 0;
 	int crecv = arg2 && strcmp(arg2, "--crecv") == 0;
 	int iso = arg2 && strcmp(arg2, "--iso") == 0;
 	int sendn = arg2 && strcmp(arg2, "--sendn") == 0;
 	int sendbig = arg2 && strcmp(arg2, "--sendbig") == 0;
 	int asend = arg2 && strcmp(arg2, "--asend") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv || crecv || iso || sendn || sendbig || asend) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || brecv || crecv || iso || sendn || sendbig || asend) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -571,6 +602,9 @@ int main(int argc, char **argv)
 	}
 	if (recv) {
 		return do_recv(argc > 3 ? atoi(argv[3]) : 1);   /* --recv [count] */
+	}
+	if (brecv) {
+		return do_brecv(argc > 3 ? atoi(argv[3]) : 1);  /* --brecv [count] */
 	}
 	if (crecv) {
 		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --crecv <peer_addr>\n", argv[0]); return 2; }
