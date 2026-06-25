@@ -152,9 +152,14 @@ static int gen_neighbors(uint8_t *buf, size_t sz, uint64_t off, void *ctx)
 			}
 			uint32_t age = (k_uptime_get_32() - c->neighbors[i].last_seen) / 1000U;
 
-			p += snprintf(nb + p, sizeof(nb) - p, "%02x:%02x rssi %d age %us\n",
+			/* addr (HONR/short, mutable) · node_id (stable, 0=unknown) ·
+			 * real RSSI/SNR from the PHY · age. For peer discovery: connect by
+			 * addr now, match by node_id across re-joins. */
+			p += snprintf(nb + p, sizeof(nb) - p,
+				      "%02x:%02x node %08x rssi %d snr %d age %us\n",
 				      c->neighbors[i].addr[4], c->neighbors[i].addr[5],
-				      c->neighbors[i].rssi, age);
+				      c->neighbors[i].node_id, c->neighbors[i].rssi,
+				      c->neighbors[i].snr, age);
 		}
 	}
 	return emit(buf, sz, off, nb);
