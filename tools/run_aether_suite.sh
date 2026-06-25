@@ -217,6 +217,17 @@ settle
 id_check "$A" "node A"
 id_check "$B" "node B"
 
+# 4a-ii: §6a status surface -- a connect-ff:ff conversation MUST report
+#        "broadcast best-effort" (distinct from connected/announced/unconnected),
+#        so a client can tell it has joined the party line (spec §6a).
+bstat_check(){  # <sock> <label>
+  local st
+  st=$("$AC" "$1" --bstatus 2>&1 | sed -n 's/.*status: //p'); settle
+  if [ "$st" = "broadcast best-effort" ]; then ok "$2 §6a status: '$st'"
+  else no "$2 §6a status" "got '$st' (expected 'broadcast best-effort')"; fi
+}
+bstat_check "$A" "node A"
+
 # 4b: a connect-ff:ff (§6a) receiver sees the SENDER'S DURABLE IDENTITY as src,
 #     not 00:00:00:00:<honr>. B broadcasts; A receives. Best-effort -> retry once.
 bsrc(){  # <recv_sock> <send_sock> <expect-identity> <label>
@@ -246,6 +257,20 @@ sleep 3; kill "$ep" 2>/dev/null; wait "$ep" 2>/dev/null; settle
 if grep -q "from $idA" /tmp/_e.log 2>/dev/null; then
   no "own-echo suppression" "node A received its own broadcast (src=$idA)"
 else ok "own-echo suppression (A did not receive its own broadcast)"; fi
+
+# NOTE -- deliberately NOT asserted device-in-the-loop (belongs in the native_sim
+# multinode harness, where topology + counters are deterministic):
+#   * Tree-aware relay (leaf stays silent / interior re-broadcasts): packets_-
+#     forwarded is shell-only, and a co-located bench is a flat 1-hop star, so
+#     "leaf vs interior" can't be distinguished here. native_sim builds a known
+#     tree and asserts the forwarded-count delta per node.
+#   * Identity<->link coherence (heymac short_addr == identity[4:5]): the link
+#     short address isn't exposed over 9P; a native_sim unit test on the HeyMac
+#     identity generation asserts the slice + the LAA-unicast bits directly.
+# Also note: Phase 2's announced/connected datagrams intentionally still carry a
+# HONR-derived src (00:00:00:00:<honr>) -- unicast keeps the routing address as
+# src so stop-and-wait ARQ ACKs can route back. Only the §6a BROADCAST src is the
+# durable identity (above). That split is by design until unicast is decoupled.
 
 # ==========================================================================
 echo; echo "########## SUMMARY ##########"
