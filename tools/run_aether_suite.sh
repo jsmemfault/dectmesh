@@ -5,11 +5,19 @@
 #
 #   Phase 1  single-node conformance        (tools/aether_test, on node A)
 #   Phase 2  two-node datagram delivery      (tools/aether_conv, A <-> B)
+#   Phase 5  forced multi-hop topology       (aether deny/allow, A <-> B)
+#   Phase 6  multi-hop chat conversation     (A <-> DK <-> B, mutually denied)
 #
 # Auto-detects two Thingy:91 X 9P ports (/dev/cu.usbmodem*3), brings up socats,
 # waits for the mesh to converge to distinct addresses, runs the battery, and
 # prints a PASS/FAIL summary. Datagram-delivery checks retry once so a single
 # transient drop does not fail them; the reliability check stays honest.
+#
+# Phase 6 needs a 3rd node (the DK, or any relay) actually powered and meshing
+# -- not console-observed, just present -- since A and B stay mutually denied
+# from Phase 5 and the only path left is whatever's relaying. No extra env var
+# needed; if there's no relay in range the exchange will genuinely fail, which
+# is the correct (if unexciting) result.
 #
 # Usage:  bash tools/run_aether_suite.sh
 #
@@ -37,6 +45,24 @@ trun(){ "$@" & local p=$!; for i in $(seq 1 "${TRUN_TO:-10}"); do kill -0 "$p" 2
 # first write gets EPIPE. A beat between handoffs avoids it. (The link is fine -- a
 # standalone aether_test is 23/23; only the un-settled handoff trips it.)
 settle(){ sleep 3; }
+
+# console_cmd <tty-port> <shell-cmd> <capture-secs> -- open a node's console
+# UART directly (NOT the 9P port), send one shell command, capture output for
+# N seconds. Used for `aether deny`/`aether allow`/`aether chat`, which are
+# shell-only (no 9P ctl node exists for them). Same recipe as the manual bench
+# procedure: exec the raw tty, stty it, printf the command, cat with a
+# self-killing perl alarm (macOS has no `timeout`).
+console_cmd(){
+  local port="$1" cmd="$2" secs="${3:-6}" out
+  exec 9<>"$port"
+  stty -f "$port" 115200 cs8 -cstopb -parenb -echo -ixon clocal -hupcl
+  printf '\r%s\r' "$cmd" >&9
+  out=$(perl -e "alarm $secs; exec @ARGV" cat <&9)
+  exec 9<&-
+  printf '%s' "$out"
+}
+# Thingy console is the *01 CDC sibling of the *03 9P port used elsewhere.
+console_of(){ echo "${1%03}01"; }
 
 # --- build the host tools --------------------------------------------------
 cc -O2 -o "$AC" "$HERE/aether_conv.c" || { echo "build aether_conv failed"; exit 2; }
@@ -271,6 +297,124 @@ else ok "own-echo suppression (A did not receive its own broadcast)"; fi
 # HONR-derived src (00:00:00:00:<honr>) -- unicast keeps the routing address as
 # src so stop-and-wait ARQ ACKs can route back. Only the §6a BROADCAST src is the
 # durable identity (above). That split is by design until unicast is decoupled.
+
+# ==========================================================================
+# Phase 5: forced multi-hop topology. `aether deny <addr>` (aephyr
+# aether_mesh_deny_neighbor(), dect_mesh 0.7.25+) rejects a specific address at
+# admission and evicts it immediately even though it's in radio range -- lets
+# the desk rig prove a relayed path (the field test's headline claim) without
+# leaving the bench. Deny is mutual + one-directional per side, so both A and
+# B must deny each other. `aether allow` undoes it at the end so denylist
+# slots (CONFIG_AETHER_MAX_DENYLIST, currently 8) don't fill up across runs.
+echo; echo "########## Phase 5: forced multi-hop topology (aether deny/allow) ##########"
+
+CA=$(console_of "${PORTS[0]}"); CB=$(console_of "${PORTS[1]}")
+nbrs(){ "$P9" "$1" rd:dev/aether/neighbors 2>/dev/null; }   # 9P: no console needed to READ
+routes(){ "$P9" "$1" rd:dev/aether/routes 2>/dev/null; }
+
+echo "  denying B ($DB) on A's console, A ($DA) on B's console..."
+console_cmd "$CA" "aether deny $DB" 5 >/tmp/_deny_a.log
+console_cmd "$CB" "aether deny $DA" 5 >/tmp/_deny_b.log
+settle
+
+nA=$(nbrs "$A"); settle; rA=$(routes "$A"); settle
+if ! echo "$nA" | grep -qi "$DB" && ! echo "$rA" | grep -qi "$DB"; then
+  ok "forced topology: A no longer sees B as a neighbor or direct route"
+else
+  no "forced topology" "A still shows B in neighbors/routes -- deny not applied? nbrs='$nA' routes='$rA'"
+fi
+nB=$(nbrs "$B"); settle; rB=$(routes "$B"); settle
+if ! echo "$nB" | grep -qi "$DA" && ! echo "$rB" | grep -qi "$DA"; then
+  ok "forced topology: B no longer sees A as a neighbor or direct route"
+else
+  no "forced topology" "B still shows A in neighbors/routes -- deny not applied? nbrs='$nB' routes='$rB'"
+fi
+
+# ==========================================================================
+# Phase 6: full multi-hop chat conversation, demonstrated end to end. A and B
+# remain mutually denied from Phase 5 -- any line that crosses can ONLY have
+# gone via the DK's relay (aether_mesh_deny_neighbor() gates on the immediate
+# link-layer sender, so a denied node's frames are blocked directly but its
+# relayed copies, arriving with the DK as immediate sender, are not -- see
+# aether_mesh.c). Exchanges a real back-and-forth, then replays `aether
+# chatlog` on both ends to produce an actual transcript artifact, not just a
+# pass/fail: the point is to SHOW a conversation happened, with each line's
+# delivery independently verified against the recipient's own scrollback.
+echo; echo "########## Phase 6: multi-hop chat conversation (forced topology) ##########"
+
+RUNTAG="run$$"
+CONV=(
+  "A:hello node three -- reading you via the mesh [$RUNTAG]"
+  "B:copy node one -- this can only be reaching me through the relay [$RUNTAG]"
+  "A:confirming: you and I are mutually denied right now [$RUNTAG]"
+  "B:confirmed -- nothing direct is getting through, only the DK [$RUNTAG]"
+  "A:multi-hop party-line chat: proven end to end [$RUNTAG]"
+)
+
+send_line(){  # <line>
+  local side="${1%%:*}" text="${1#*:}"
+  local port=$([ "$side" = A ] && echo "$CA" || echo "$CB")
+  console_cmd "$port" "aether chat $text" 3 >/dev/null
+}
+
+echo "  exchanging ${#CONV[@]} lines between A and B (mutually denied, DK-only path)..."
+for line in "${CONV[@]}"; do
+  send_line "$line"
+  sleep 2
+done
+settle
+
+# Chat is best-effort broadcast (no ARQ -- see aether_mesh.c: "Broadcasts are
+# not ACKed, no single acker"), so a single-send miss over 2 hops is expected
+# occasionally, same as Phase 2's reliability note. Retry once, same pattern
+# as the ann/conn helpers above, before calling a line genuinely undelivered.
+logA=$(console_cmd "$CA" "aether chatlog" 5)
+logB=$(console_cmd "$CB" "aether chatlog" 5)
+
+missing=()
+for line in "${CONV[@]}"; do
+  side="${line%%:*}"; text="${line#*:}"
+  peer_log=$([ "$side" = A ] && echo "$logB" || echo "$logA")
+  printf '%s' "$peer_log" | grep -qF "$text" || missing+=("$line")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "  ${#missing[@]} line(s) missing after first pass, retrying once..."
+  for line in "${missing[@]}"; do
+    send_line "$line"
+    sleep 2
+  done
+  settle
+  logA=$(console_cmd "$CA" "aether chatlog" 5)
+  logB=$(console_cmd "$CB" "aether chatlog" 5)
+fi
+
+echo; echo "  ---- transcript (script-ordered, delivery verified against recipient's chatlog) ----"
+xcript_fail=0
+for line in "${CONV[@]}"; do
+  side="${line%%:*}"; text="${line#*:}"
+  if [ "$side" = A ]; then peer_log="$logB"; tag="A"; else peer_log="$logA"; tag="B"; fi
+  if printf '%s' "$peer_log" | grep -qF "$text"; then
+    delivered="delivered"
+  else
+    delivered="NOT DELIVERED"; xcript_fail=$((xcript_fail+1))
+  fi
+  printf '  [%s] %s   (%s)\n' "$tag" "$text" "$delivered"
+done
+echo "  ---- end transcript ----"; echo
+
+if [ "$xcript_fail" = 0 ]; then
+  ok "multi-hop chat conversation: all ${#CONV[@]} lines delivered via the DK despite mutual deny"
+else
+  no "multi-hop chat conversation" "$xcript_fail/${#CONV[@]} line(s) not delivered -- see transcript above"
+fi
+
+echo "  -- raw chatlog, node A --"; printf '%s\n' "$logA" | sed 's/^/    /'
+echo "  -- raw chatlog, node B --"; printf '%s\n' "$logB" | sed 's/^/    /'
+
+echo "  restoring: allowing B on A, A on B (keep denylist from filling across runs)..."
+console_cmd "$CA" "aether allow $DB" 4 >/dev/null
+console_cmd "$CB" "aether allow $DA" 4 >/dev/null
+settle
 
 # ==========================================================================
 echo; echo "########## SUMMARY ##########"
