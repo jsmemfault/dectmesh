@@ -1252,6 +1252,11 @@ static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+/* Advertising restart is deferred to this work item (see adv_work_fn) so it
+ * never runs inside a bt_conn callback. */
+static void adv_work_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(adv_restart_work, adv_work_fn);
+
 /* Legacy connectable advertising. (Re)started on boot and after each disconnect
  * (connectable adv stops itself on connect). bt_le_adv_start re-creates the set
  * each call, so it is safe to call again from the disconnect handler. */
@@ -1268,10 +1273,31 @@ static int adv_start(void)
 	return bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 }
 
+/* Restart advertising from a workqueue, NOT directly in the disconnected
+ * callback: right after a disconnect the connection object may not be fully
+ * released yet, so bt_le_adv_start() can return -EAGAIN/-ENOMEM. The old code
+ * called it inline and ignored the error -> advertising silently never came
+ * back, and the device was only discoverable until its first connection. Defer
+ * + retry until it sticks (and treat -EALREADY as success). */
+static void adv_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	int err = adv_start();
+
+	if (err == 0 || err == -EALREADY) {
+		LOG_INF("advertising up");
+		return;
+	}
+	LOG_WRN("adv restart failed (%d); retrying in 250ms", err);
+	k_work_reschedule(&adv_restart_work, K_MSEC(250));
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		LOG_ERR("BLE connect failed (0x%02x)", err);
+		/* A failed connect leaves us not advertising -- bring it back. */
+		k_work_reschedule(&adv_restart_work, K_NO_WAIT);
 		return;
 	}
 	LOG_INF("BLE connected");
@@ -1280,7 +1306,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("BLE disconnected (0x%02x), re-advertising", reason);
-	(void)adv_start();
+	/* Defer to the workqueue so the stack finishes tearing down the conn. */
+	k_work_reschedule(&adv_restart_work, K_NO_WAIT);
 }
 
 BT_CONN_CB_DEFINE(conn_cbs) = {
