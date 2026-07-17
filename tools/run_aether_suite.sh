@@ -20,6 +20,11 @@
 # is the correct (if unexciting) result.
 #
 # Usage:  bash tools/run_aether_suite.sh
+#         QUIET=0 bash tools/run_aether_suite.sh
+#           (Phase 6's raw chatlog dump is cleaned by default -- ANSI/cursor
+#            codes and per-frame DECT/HeyMac RX chatter stripped, for a demo-
+#            presentable transcript. QUIET=0 shows the untouched console
+#            stream instead, e.g. for debugging a console_cmd capture itself.)
 #
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,6 +51,20 @@ trun(){ "$@" & local p=$!; for i in $(seq 1 "${TRUN_TO:-10}"); do kill -0 "$p" 2
 # standalone aether_test is 23/23; only the un-settled handoff trips it.)
 settle(){ sleep 3; }
 
+# Strip ANSI/cursor-movement escapes, bare prompt-redraw lines, and the
+# per-frame DECT/HeyMac RX chatter that otherwise floods any raw console
+# capture -- for demo/presentation output (see Phase 6's raw chatlog dump).
+# Never used for functional checks (grep -qF against message text is
+# unaffected either way); purely a readability pass. Set QUIET=0 to disable
+# and see the raw stream (e.g. for debugging a console_cmd capture itself).
+clean_console(){
+  [ "${QUIET:-1}" = 0 ] && { cat; return; }
+  sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+    | grep -vE 'DECT RX:|HeyMac RX:|mesh DATA from' \
+    | grep -vE '^[[:space:]]*ae [0-9a-f]{2}:[0-9a-f]{2}>[[:space:]]*$' \
+    | sed '/^[[:space:]]*$/d'
+}
+
 # console_cmd <tty-port> <shell-cmd> <capture-secs> -- open a node's console
 # UART directly (NOT the 9P port), send one shell command, capture output for
 # N seconds. Used for `aether deny`/`aether allow`/`aether chat`, which are
@@ -57,7 +76,7 @@ console_cmd(){
   exec 9<>"$port"
   stty -f "$port" 115200 cs8 -cstopb -parenb -echo -ixon clocal -hupcl
   printf '\r%s\r' "$cmd" >&9
-  out=$(perl -e "alarm $secs; exec @ARGV" cat <&9)
+  out=$(perl -e "alarm $secs; exec @ARGV" cat <&9 | clean_console)
   exec 9<&-
   printf '%s' "$out"
 }
