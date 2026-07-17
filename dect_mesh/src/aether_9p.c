@@ -455,6 +455,14 @@ int aether_9p_init(struct net_if *iface)
 	}
 
 	LOG_INF("9P server up: /net/aether over %s", uart->name);
+
+	/* Second server instance: the same namespace served over the mesh
+	 * itself (reliable unicast datagrams as the 9P transport). Non-fatal
+	 * if it fails -- the UART/USB path stays up either way. */
+	ret = aether_9p_mesh_init(iface, &sc);
+	if (ret < 0) {
+		LOG_WRN("9P-over-mesh server not started: %d", ret);
+	}
 	return 0;
 }
 

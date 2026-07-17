@@ -16,9 +16,20 @@
 #include <stdint.h>
 #include <stddef.h>
 
+struct ninep_server_config;
+
 #ifdef CONFIG_NINEP
 /** @brief Start the 9P server serving /net/aether over the chosen UART. */
 int aether_9p_init(struct net_if *iface);
+
+/**
+ * @brief Start the second 9P server serving the same namespace over the MESH:
+ * reliable unicast datagrams as the transport, one datagram per 9P message.
+ * Lets a peer (or a host driving a peer's conversation layer) mount this
+ * node's filesystem across the mesh, through relays.
+ */
+int aether_9p_mesh_init(struct net_if *iface,
+			const struct ninep_server_config *base_sc);
 
 /** @brief Append a received party-line message to the /net/aether/chat log. */
 void aether_9p_chat_log(const uint8_t src[6], const uint8_t *data, size_t len);

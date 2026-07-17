@@ -582,10 +582,98 @@ static int do_iso_recv(const char *real, const char *fake)
 	}
 }
 
+/* ---- 9P-over-mesh bridge -------------------------------------------------
+ * --bridge <peer> <unix-path>: serve a byte-stream 9P endpoint on a unix
+ * socket, relaying each framed 9P message as ONE reliable mesh datagram
+ * through THIS node's conversation layer to <peer>'s mesh 9P server -- and
+ * each reply datagram back as the R-message. Strictly request-response (9P is
+ * client-driven), so no polling is needed: read a T from the client, write it
+ * to the conversation, block on the conversation read for the R, hand it back.
+ * Point plan9port at it:  9p -a 'unix!<path>' ls /   -- and you are listing a
+ * far node's filesystem across the mesh, through relays.
+ */
+static int readn_fd(int cfd, uint8_t *buf, int n)
+{
+	int got = 0;
+
+	while (got < n) {
+		int r = (int)read(cfd, buf + got, n - got);
+		if (r <= 0) return -1;
+		got += r;
+	}
+	return n;
+}
+
+static int do_bridge(const char *peer, const char *lpath)
+{
+	uint8_t rb[600], msg[600];
+
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1);
+	if (n < 0) { fprintf(stderr, "clone read failed\n"); return 1; }
+	rb[n] = 0;
+	int conv = atoi((char *)rb);
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "ctl connect failed\n"); return 1; }
+	fprintf(stderr, "[bridge] conv %d connected to %s; 9P endpoint on %s\n", conv, peer, lpath);
+
+	unlink(lpath);
+	int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un la = { .sun_family = AF_UNIX };
+	strncpy(la.sun_path, lpath, sizeof(la.sun_path) - 1);
+	if (bind(ls, (struct sockaddr *)&la, sizeof(la)) < 0 || listen(ls, 4) < 0) { perror("listen"); return 1; }
+
+	/* Serve clients sequentially, keeping the ONE mesh conversation open the
+	 * whole time -- plan9port's 9p opens a fresh connection per command. */
+	for (;;) {
+		int cfd = accept(ls, NULL, NULL);
+		if (cfd < 0) break;
+		fprintf(stderr, "[bridge] client attached; relaying (one reliable datagram per 9P message)\n");
+		for (;;) {
+			uint8_t hdr[4];
+			if (readn_fd(cfd, hdr, 4) < 0) break;
+			uint32_t sz = (uint32_t)hdr[0] | (hdr[1] << 8) | (hdr[2] << 16) |
+				      ((uint32_t)hdr[3] << 24);
+			if (sz < 7 || sz > sizeof(msg)) { fprintf(stderr, "[bridge] bad msg size %u\n", sz); break; }
+			memcpy(msg, hdr, 4);
+			if (readn_fd(cfd, msg + 4, (int)sz - 4) < 0) break;
+			uint16_t want = (uint16_t)(msg[5] | (msg[6] << 8));  /* this T's 9P tag */
+			/* Retry a transient mesh drop of THIS request, then TAG-MATCH the
+			 * reply: a resend can produce a duplicate/late R, and the datagram
+			 * conversation is untagged at the mesh layer, so read replies until
+			 * one bears this T's 9P tag -- discard stale ones. Without this the
+			 * reply stream desyncs (a Tread getting a leftover Ropen). */
+			int rn = -1;
+			for (int attempt = 0; attempt < 4 && rn <= 0; attempt++) {
+				if (do_write(2, msg, (int)sz) < 0) { continue; }
+				for (int reads = 0; reads < 6; reads++) {
+					int r = do_read(2, 0, rb, sizeof(rb));
+					if (r <= 0) break;                  /* no reply this attempt; resend */
+					if (r >= 7 && (uint16_t)(rb[5] | (rb[6] << 8)) == want) { rn = r; break; }
+					fprintf(stderr, "[bridge] discarding stale R tag=%u (want %u)\n",
+						(unsigned)(rb[5] | (rb[6] << 8)), want);
+				}
+			}
+			if (rn <= 0) { fprintf(stderr, "[bridge] mesh round-trip failed after retries (T type=%u tag=%u)\n", msg[4], want); break; }
+			if (write(cfd, rb, rn) != rn) break;
+			fprintf(stderr, "[bridge] T%u (%u B) -> R%u (%d B) across the mesh\n",
+				msg[4], sz, rn >= 5 ? rb[4] : 0, rn);
+		}
+		close(cfd);
+		fprintf(stderr, "[bridge] client detached (mesh conversation stays open)\n");
+	}
+	close(ls);
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --recv | --put <path> <file> [chunk]]\n", argv[0]);
+		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --recv | --put <path> <file> [chunk] | --bridge <peer> <listen-path>]\n", argv[0]);
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
@@ -608,7 +696,8 @@ int main(int argc, char **argv)
 	int sendbig = arg2 && strcmp(arg2, "--sendbig") == 0;
 	int asend = arg2 && strcmp(arg2, "--asend") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
-	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || crecv || iso || sendn || sendbig || asend) ? NULL : arg2;
+	int bridge = arg2 && strcmp(arg2, "--bridge") == 0;
+	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || crecv || iso || sendn || sendbig || asend || bridge) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -618,6 +707,10 @@ int main(int argc, char **argv)
 	if (put) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --put <path> <file> [chunk]\n", argv[0]); return 2; }
 		return do_put(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 1024);
+	}
+	if (bridge) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --bridge <peer_addr> <unix_listen_path>\n", argv[0]); return 2; }
+		return do_bridge(argv[3], argv[4]);
 	}
 	if (hold) {
 		return do_hold();
