@@ -1,0 +1,34 @@
+  denying B (00:00:00:00:40:00) on A's console, A (00:00:00:00:30:00) on B's console...
+  [PASS] forced topology: A no longer sees B as a neighbor or direct route
+  [PASS] forced topology: B no longer sees A as a neighbor or direct route
+
+########## Phase 6: multi-hop chat conversation (forced topology) ##########
+  exchanging 5 lines between A and B (mutually denied, DK-only path)...
+
+  ---- transcript (script-ordered, delivery verified against recipient's chatlog) ----
+  [A] hello node three -- reading you via the mesh [run43019]   (delivered)
+  [B] copy node one -- this can only be reaching me through the relay [run43019]   (delivered)
+  [A] confirming: you and I are mutually denied right now [run43019]   (delivered)
+  [B] confirmed -- nothing direct is getting through, only the DK [run43019]   (delivered)
+  [A] multi-hop party-line chat: proven end to end [run43019]   (delivered)
+  ---- end transcript ----
+
+  [PASS] multi-hop chat conversation: all 5 lines delivered via the DK despite mutual deny
+  -- raw chatlog, node A --
+    ae d1:28> aether chatlog
+    <70:33> copy node one -- this can only be reaching me through the relay [run42684]
+    <70:33> confirmed -- nothing direct is getting through, only the DK [run42684]
+    <70:33> copy node one -- this can only be reaching me through the relay [run43019]
+    <70:33> confirmed -- nothing direct is getting through, only the DK [run43019]
+    ae d1:28> ae d1:28> 
+  -- raw chatlog, node B --
+    ae 70:33> aether chatlog
+    <d1:28> hello node three -- reading you via the mesh [run42684]
+    <d1:28> confirming: you and I are mutually denied right now [run42684]
+    <d1:28> hello node three -- reading you via the mesh [run43019]
+    <d1:28> confirming: you and I are mutually denied right now [run43019]
+    <d1:28> multi-hop party-line chat: proven end to end [run43019]
+    ae 70:33> ae 70:33> 
+  restoring: allowing B on A, A on B...
+
+PASS=3 FAIL=0

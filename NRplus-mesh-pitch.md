@@ -1,6 +1,6 @@
 # An open-source mesh stack for Nordic's non-cellular radios
 
-*Internal proposal — Jon Sharp, nRF Cloud · June 2026*
+*Internal proposal — Jon Sharp, nRF Cloud · June 2026 (updated July 2026: multi-hop proven)*
 
 **One line:** Nordic ships world-class non-cellular PHYs (DECT NR+ today, sub-GHz NR+ next) but no
 open, Zephyr-native, multi-hop mesh to run on them. I've built one — a self-organizing mesh in which
@@ -28,10 +28,16 @@ band (§15.323)** where the work began, and now on the **915 MHz sub-GHz band (R
 firmware**, built directly on the DECT NR+ **PHY API**. (The same stack running on both bands is
 itself the portability point, and a head start on the sub-GHz NR+ roadmap below.)
 
-*Honest scope of the hardware proof: demonstrated today on a **two-node bench** — self-organization,
-self-heal by re-election, reliable acknowledged transport, and the full 9P fabric below. The routing
-layer (HONR16, stateless-tree) is **built for multi-hop**; standing up a three-node relay topology is
-the immediate next bench milestone, not a redesign.*
+*Hardware proof, updated: three nodes, self-organization, self-heal by re-election, reliable
+acknowledged transport, and the full 9P fabric below — **and multi-hop, proven.** A repeatable,
+automated regression test forces two nodes to refuse each other directly (`aether deny`, gated on
+the link-layer immediate sender so a relayed frame still gets through even though its original
+sender is denied) and then drives a real multi-line chat exchange between them, independently
+verifying every line's delivery against the recipient's own scrollback. It runs the same way every
+time — not a one-off demo trick — and building it caught (and fixed) two real protocol bugs along
+the way: an admission-control check that gated on the wrong address, and a durable-identity /
+routing-address conflation across two layers. The multi-hop claim is on solid, tested ground now,
+not a promise for the next milestone.*
 
 **Pillar 1 — a self-organizing mesh.**
 - **Zero-config:** runtime root election, shallowest-parent join, and **root-loss self-healing** —
@@ -62,10 +68,12 @@ right layer — and it pre-fits the **sub-GHz NR+** part on the roadmap.
 
 Code is a clean, MIT-licensed Zephyr module. 3-minute demo video (script ready — recording next): [link].
 
-> **See it in 3 minutes.** (1) Pull the root node → a surviving node re-elects itself and the network
-> re-forms. (2) `cat` a node's live
-> state from a laptop over BLE. (3) Update a USB-less radio's firmware by *writing a file*. Self-healing,
-> everything-is-a-file, and OTA-as-`cp` — on real hardware, identical firmware on every node.
+> **See it in a few minutes.** (1) Pull the root node → a surviving node re-elects itself and the
+> network re-forms. (2) Force two nodes to refuse each other directly and watch a live chat
+> exchange still cross between them — multi-hop, proven on camera, not asserted. (3) `cat` a node's
+> live state from a laptop over BLE. (4) Update a USB-less radio's firmware by *writing a file*.
+> Self-healing, multi-hop, everything-is-a-file, and OTA-as-`cp` — on real hardware, identical
+> firmware on every node.
 
 ## Why this is strategic for Nordic
 - **Drives silicon adoption.** Open + easy mesh lowers the barrier to choosing a 9151 / future sub-GHz
