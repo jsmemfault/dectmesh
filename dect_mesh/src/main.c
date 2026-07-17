@@ -231,9 +231,19 @@ static int cmd_aether_status(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	shell_print(sh, "=== Æther Node Status ===");
-	shell_print(sh, "  addr   %02x:%02x:%02x:%02x:%02x:%02x",
+	/* identity: the durable node_eui -- use THIS to reference the node (in
+	 * `aether deny`, scripts, docs). It survives HONR re-join/re-election. */
+	shell_print(sh, "  identity  %02x:%02x:%02x:%02x:%02x:%02x",
+		    ctx->node_eui[0], ctx->node_eui[1], ctx->node_eui[2],
+		    ctx->node_eui[3], ctx->node_eui[4], ctx->node_eui[5]);
+#if defined(CONFIG_AETHER_ROUTING_HONR)
+	/* honr addr: the routing-layer address -- churns with the tree (re-join,
+	 * re-election). Shown here because neighbor/route tables below are keyed
+	 * in this same address space, NOT because it's a stable node reference. */
+	shell_print(sh, "  honr addr %02x:%02x:%02x:%02x:%02x:%02x",
 		    ctx->local_addr[0], ctx->local_addr[1], ctx->local_addr[2],
 		    ctx->local_addr[3], ctx->local_addr[4], ctx->local_addr[5]);
+#endif
 	shell_print(sh, "  net_id 0x%04x", ctx->mesh_net_id);
 
 	hctx = net_if_l2_data(aether_iface);
@@ -360,14 +370,16 @@ static int cmd_aether_info(const struct shell *sh, size_t argc, char **argv)
 	hctx = net_if_l2_data(aether_iface);
 
 	shell_print(sh, "=== Æther Parameters ===");
-	shell_print(sh, "  addr        %02x:%02x:%02x:%02x:%02x:%02x",
-		    ctx->local_addr[0], ctx->local_addr[1], ctx->local_addr[2],
-		    ctx->local_addr[3], ctx->local_addr[4], ctx->local_addr[5]);
+	/* identity: the durable node_eui -- survives HONR re-join/re-election.
+	 * Use this, not the routing address below, to reference the node. */
+	shell_print(sh, "  identity    %02x:%02x:%02x:%02x:%02x:%02x",
+		    ctx->node_eui[0], ctx->node_eui[1], ctx->node_eui[2],
+		    ctx->node_eui[3], ctx->node_eui[4], ctx->node_eui[5]);
 	shell_print(sh, "  net_id      0x%04x", ctx->mesh_net_id);
 	shell_print(sh, "  mac state   %s", hctx ? heymac_state_name(hctx->state) : "?");
 #if defined(CONFIG_AETHER_ROUTING_HONR)
-	shell_print(sh, "  honr addr   %04x (%s)", ctx->honr_addr,
-		    ctx->honr_joined ? "joined" : "unjoined");
+	shell_print(sh, "  honr addr   %04x (%s, routing address -- churns with the tree)",
+		    ctx->honr_addr, ctx->honr_joined ? "joined" : "unjoined");
 #endif
 	shell_print(sh, "  ttl         %d hops", CONFIG_AETHER_DEFAULT_TTL);
 	shell_print(sh, "  hello int   %d s", CONFIG_AETHER_HELLO_INTERVAL);
@@ -423,6 +435,156 @@ static int cmd_aether_chat(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	shell_print(sh, "<you> %s", msg);
+	return 0;
+}
+
+/* Replay the party-line scrollback -- the same rolling buffer /net/aether/chat
+ * serves to 9P readers -- so the console can see history, not just messages
+ * that happened to arrive while someone was watching. `aether chatlog [n]`
+ * shows everything, or just the last n lines. */
+static int cmd_aether_chatlog(const struct shell *sh, size_t argc, char **argv)
+{
+	static char snap[1024];
+	size_t len;
+	long n_lines = -1;
+
+	if (argc >= 2) {
+		char *end;
+
+		n_lines = strtol(argv[1], &end, 10);
+		if (*end != '\0' || n_lines < 0) {
+			shell_error(sh, "Usage: aether chatlog [n]");
+			return -EINVAL;
+		}
+	}
+
+	len = aether_9p_chat_log_snapshot(snap, sizeof(snap));
+	if (len == 0) {
+		shell_print(sh, "(no chat history yet)");
+		return 0;
+	}
+
+	const char *start = snap;
+
+	if (n_lines >= 0) {
+		/* Walk back from the end counting newlines to find where the last
+		 * n_lines begin: the (n_lines+1)-th newline from the end marks the
+		 * end of the line just before the ones we want to keep. */
+		const char *p = snap + len;
+		long count = 0;
+
+		while (p > snap) {
+			p--;
+			if (*p == '\n') {
+				count++;
+				if (count > n_lines) {
+					p++;
+					break;
+				}
+			}
+		}
+		start = p;
+	}
+
+	shell_fprintf(sh, SHELL_NORMAL, "%.*s", (int)(snap + len - start), start);
+	return 0;
+}
+
+/* Parse "xx:xx:xx:xx:xx:xx" into a 6-byte address. (Unlike cmd_aether_send's
+ * sscanf into unsigned int* aliased over uint8_t[6] -- that overruns each byte
+ * slot by 3 bytes -- parse into unsigned int locals first, then narrow.) */
+static int parse_mesh_addr(const char *s, uint8_t addr[6])
+{
+	unsigned int b[6];
+	int n = sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x",
+		       &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+
+	if (n != 6) {
+		return -EINVAL;
+	}
+	for (int i = 0; i < 6; i++) {
+		addr[i] = (uint8_t)b[i];
+	}
+	return 0;
+}
+
+/* Bench-test topology forcing: reject a specific neighbor at admission even
+ * though it's in radio range, so a relay's hop becomes the only path. See
+ * aether_mesh_deny_neighbor() in aephyr for the mechanism. */
+static int cmd_aether_deny(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t addr[6];
+
+	ARG_UNUSED(argc);
+	if (parse_mesh_addr(argv[1], addr) < 0) {
+		shell_error(sh, "Usage: aether deny <xx:xx:xx:xx:xx:xx>");
+		return -EINVAL;
+	}
+	if (!aether_iface) {
+		shell_error(sh, "Æther interface not available");
+		return -ENODEV;
+	}
+
+	int ret = aether_mesh_deny_neighbor(aether_iface, addr);
+
+	if (ret < 0) {
+		shell_error(sh, "deny failed: %d (denylist full?)", ret);
+		return ret;
+	}
+	shell_print(sh, "Denied %02x:%02x:%02x:%02x:%02x:%02x -- dropped at RX, "
+		    "evicted if already a neighbor", addr[0], addr[1], addr[2],
+		    addr[3], addr[4], addr[5]);
+	return 0;
+}
+
+static int cmd_aether_allow(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t addr[6];
+
+	ARG_UNUSED(argc);
+	if (parse_mesh_addr(argv[1], addr) < 0) {
+		shell_error(sh, "Usage: aether allow <xx:xx:xx:xx:xx:xx>");
+		return -EINVAL;
+	}
+	if (!aether_iface) {
+		shell_error(sh, "Æther interface not available");
+		return -ENODEV;
+	}
+
+	int ret = aether_mesh_allow_neighbor(aether_iface, addr);
+
+	if (ret < 0) {
+		shell_error(sh, "%02x:%02x:%02x:%02x:%02x:%02x was not denied",
+			    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+		return ret;
+	}
+	shell_print(sh, "Allowed %02x:%02x:%02x:%02x:%02x:%02x", addr[0], addr[1],
+		    addr[2], addr[3], addr[4], addr[5]);
+	return 0;
+}
+
+static int cmd_aether_denylist(const struct shell *sh, size_t argc, char **argv)
+{
+	struct aether_mesh_ctx *ctx = g_mesh_ctx;
+
+	if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+		if (aether_iface) {
+			aether_mesh_denylist_clear(aether_iface);
+		}
+		shell_print(sh, "Denylist cleared");
+		return 0;
+	}
+
+	if (!ctx) {
+		shell_print(sh, "Æther mesh not initialized");
+		return 0;
+	}
+	shell_print(sh, "Denylist (%u):", ctx->denylist_count);
+	for (int i = 0; i < ctx->denylist_count; i++) {
+		shell_print(sh, "    %02x:%02x:%02x:%02x:%02x:%02x",
+			    ctx->denylist[i][0], ctx->denylist[i][1], ctx->denylist[i][2],
+			    ctx->denylist[i][3], ctx->denylist[i][4], ctx->denylist[i][5]);
+	}
 	return 0;
 }
 
@@ -491,7 +653,15 @@ SHELL_STATIC_SUBCMD_SET_CREATE(aether_cmds,
 #endif
 	SHELL_CMD_ARG(hello, NULL, "Send hello message", cmd_aether_hello, 1, 0),
 	SHELL_CMD_ARG(chat, NULL, "Broadcast a party-line message", cmd_aether_chat, 2, 20),
+	SHELL_CMD_ARG(chatlog, NULL, "Replay party-line chat history: aether chatlog [n]",
+		      cmd_aether_chatlog, 1, 1),
 	SHELL_CMD_ARG(send, NULL, "Send mesh message to <addr>", cmd_aether_send, 3, 0),
+	SHELL_CMD_ARG(deny, NULL, "Deny a neighbor addr (force topology): aether deny <mac>",
+		      cmd_aether_deny, 2, 0),
+	SHELL_CMD_ARG(allow, NULL, "Un-deny a neighbor addr: aether allow <mac>",
+		      cmd_aether_allow, 2, 0),
+	SHELL_CMD_ARG(denylist, NULL, "Show/clear the denylist: aether denylist [clear]",
+		      cmd_aether_denylist, 1, 1),
 	SHELL_SUBCMD_SET_END
 );
 

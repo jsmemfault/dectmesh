@@ -22,6 +22,18 @@ int aether_9p_init(struct net_if *iface);
 
 /** @brief Append a received party-line message to the /net/aether/chat log. */
 void aether_9p_chat_log(const uint8_t src[6], const uint8_t *data, size_t len);
+
+/**
+ * @brief Copy the party-line chat scrollback (the same rolling buffer served
+ * over /net/aether/chat) into a caller buffer, for the `aether chatlog` shell
+ * command -- lets the console see history, not just messages that arrived
+ * while it happened to be watching.
+ *
+ * @param out Destination buffer
+ * @param outsz Destination size
+ * @return Number of bytes copied (<= outsz)
+ */
+size_t aether_9p_chat_log_snapshot(char *out, size_t outsz);
 #else
 static inline int aether_9p_init(struct net_if *iface)
 {
@@ -33,6 +45,12 @@ static inline void aether_9p_chat_log(const uint8_t src[6], const uint8_t *data,
 	(void)src;
 	(void)data;
 	(void)len;
+}
+static inline size_t aether_9p_chat_log_snapshot(char *out, size_t outsz)
+{
+	(void)out;
+	(void)outsz;
+	return 0;
 }
 #endif /* CONFIG_NINEP */
 

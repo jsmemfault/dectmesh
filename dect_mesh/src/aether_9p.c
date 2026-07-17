@@ -152,14 +152,18 @@ static int gen_neighbors(uint8_t *buf, size_t sz, uint64_t off, void *ctx)
 			}
 			uint32_t age = (k_uptime_get_32() - c->neighbors[i].last_seen) / 1000U;
 
-			/* addr (HONR/short, mutable) · node_id (stable, 0=unknown) ·
-			 * real RSSI/SNR from the PHY · age. For peer discovery: connect by
-			 * addr now, match by node_id across re-joins. */
+			/* addr (HONR/short, mutable) · identity (node_eui, durable,
+			 * all-zero=unknown) · real RSSI/SNR from the PHY · age. For
+			 * peer discovery: connect by addr now, match by identity
+			 * across re-joins. */
 			p += snprintf(nb + p, sizeof(nb) - p,
-				      "%02x:%02x node %08x rssi %d snr %d age %us\n",
+				      "%02x:%02x identity %02x:%02x:%02x:%02x:%02x:%02x"
+				      " rssi %d snr %d age %us\n",
 				      c->neighbors[i].addr[4], c->neighbors[i].addr[5],
-				      c->neighbors[i].node_id, c->neighbors[i].rssi,
-				      c->neighbors[i].snr, age);
+				      c->neighbors[i].node_eui[0], c->neighbors[i].node_eui[1],
+				      c->neighbors[i].node_eui[2], c->neighbors[i].node_eui[3],
+				      c->neighbors[i].node_eui[4], c->neighbors[i].node_eui[5],
+				      c->neighbors[i].rssi, c->neighbors[i].snr, age);
 		}
 	}
 	return emit(buf, sz, off, nb);
@@ -216,6 +220,17 @@ void aether_9p_chat_log(const uint8_t src[6], const uint8_t *data, size_t len)
 	memcpy(chat_log + chat_log_len, line, (size_t)n);
 	chat_log_len += (size_t)n;
 	k_mutex_unlock(&chat_mutex);
+}
+
+size_t aether_9p_chat_log_snapshot(char *out, size_t outsz)
+{
+	size_t n;
+
+	k_mutex_lock(&chat_mutex, K_FOREVER);
+	n = MIN(chat_log_len, outsz);
+	memcpy(out, chat_log, n);
+	k_mutex_unlock(&chat_mutex);
+	return n;
 }
 
 static int gen_chat(uint8_t *buf, size_t sz, uint64_t off, void *ctx)

@@ -26,6 +26,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/aether_mesh.h>
+#include <zephyr/net/heymac.h>
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/protocol.h>
 #include <string.h>
@@ -425,16 +426,22 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		n = snprintf(s, sizeof(s), "%d/%d\n", active, AETHER_MAX_CONNS);
 		break;
 	}
-	case K_STATS:
-		/* stats(5)-style: datagram counters at the /net/aether layer. "sent"/
-		 * "rcvd" are whole datagrams (post-reassembly/dedup), bytes are payload
-		 * only, tx_err = reliable-send gave up, rx_drop = a conv rxq was full. */
-		n = snprintf(s, sizeof(s),
-			     "sent %u\nrcvd %u\nsent_bytes %u\nrcvd_bytes %u\n"
-			     "tx_err %u\nrx_drop %u\n",
-			     g_fs.ctr.tx, g_fs.ctr.rx, g_fs.ctr.tx_bytes,
-			     g_fs.ctr.rx_bytes, g_fs.ctr.tx_err, g_fs.ctr.rx_drop);
+	case K_STATS: {
+		/* One-line summary: datagram rx/tx counts (whole datagrams, post-
+		 * reassembly/dedup) plus the live link signal -- the RSSI/SNR of the
+		 * most recent frame this node heard, straight off the PHY. */
+		int rssi = 0, snr = 0;
+		struct heymac_context *hc =
+			g_mesh_ctx ? net_if_l2_data(g_mesh_ctx->iface) : NULL;
+
+		if (hc) {
+			rssi = hc->last_rx_rssi;
+			snr = hc->last_rx_snr;
+		}
+		n = snprintf(s, sizeof(s), "rx %u tx %u rssi %d snr %d\n",
+			     g_fs.ctr.rx, g_fs.ctr.tx, rssi, snr);
 		break;
+	}
 	case K_MAXMSG:
 		/* spec §6: advertise the reassembled-datagram ceiling so a mounter can
 		 * negotiate msize <= it. One DECT frame today (no fragmentation). */
@@ -483,7 +490,15 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		if (d.len == 0) {
 			return 0;   /* hangup sentinel -> EOF */
 		}
-		/* §6a broadcast reads are source-prefixed, same shape as announced. */
+		/* §6a broadcast reads are source-prefixed, same shape as announced --
+		 * confirmed against the deck's actual lobby-reader contract (see
+		 * doc/dect-guidance.md): achat expects EVERY broadcast `data` read to
+		 * be exactly `[6-byte src][payload]` in one atomic read, no exceptions.
+		 * The 0.7.24 experiment that dropped the prefix for CONV_BCAST (on a
+		 * hypothesis that the prefix was the rendering problem) had it
+		 * backwards -- the prefix's ABSENCE is what breaks the deck: reads
+		 * under 6 bytes get silently dropped, longer ones get the first 6
+		 * payload bytes misread as a bogus source address. */
 		bool src_prefixed = (c->state == CONV_ANNOUNCED || c->state == CONV_BCAST);
 		uint32_t need = d.len + (src_prefixed ? 6 : 0);
 

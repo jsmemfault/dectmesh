@@ -57,7 +57,9 @@ aether chat hello from the desk
 
 **3. Datagram reliability over 2 hops** — from Node 1's 9P (held bridge):
 ```
-tools/aether_conv /tmp/9p.sock <node3-addr>      # send; ARQ ACKs round-trip via the DK
+tools/aether_conv /tmp/9p.sock <node3's dev/aether/addr (HONR routing address)>  # send; ARQ ACKs round-trip via the DK
+# NOT node3's net/aether/addr (durable identity) -- unicast dst must be the
+# HONR/routing address; the identity address won't route.
 ```
 - ✅ high delivery % over the relayed path; note retries.
 
