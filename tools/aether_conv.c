@@ -670,10 +670,95 @@ static int do_bridge(const char *peer, const char *lpath)
 	return 0;
 }
 
+/* ---- raw-channel reliability probe ----------------------------------------
+ * Runs STRICT request-response 9P over ONE held /net/aether conversation to
+ * <peer>'s mesh 9P server: send each T ONCE (no resend), read the FIRST reply
+ * datagram (bounded poll, NO tag-match), and classify. Separates the two
+ * failure modes do_bridge's shim defends against:
+ *   loss     = no reply arrived without resending the T   -> would need RETRY
+ *   mismatch = a reply arrived but wrong tag/type          -> would need TAG-MATCH
+ * A dumb transport_nsfile behaves exactly like this (first reply == the answer),
+ * so a high clean% means the conversation channel is mount-clean as a raw pipe;
+ * frequent anomalies mean the deck transport needs the shim.
+ */
+static int inner_send_recv(const uint8_t *t, int tlen, uint8_t *rb, int cap,
+			   int *rn, int poll_budget)
+{
+	*rn = 0;
+	if (do_write(2, t, tlen) < 0) return -1;         /* local/outer error */
+	for (int i = 0; i < poll_budget; i++) {
+		int n = do_read(2, 0, rb, cap);
+		if (n > 0) { *rn = n; return 1; }            /* got a datagram */
+		usleep(30000);
+	}
+	return 0;                                         /* no reply (loss) */
+}
+
+static int do_probe(const char *peer, int count)
+{
+	uint8_t rb[600], t[600];
+	int rn, o;
+
+	/* outer: open a conversation to the peer (same setup as do_bridge) */
+	if (do_version() || do_attach(0)) { fprintf(stderr, "outer setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1);
+	if (n < 0) { fprintf(stderr, "clone read failed\n"); return 1; }
+	rb[n] = 0; int conv = atoi((char *)rb);
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open failed\n"); return 1; }
+	char cmd[64]; int l = snprintf(cmd, sizeof(cmd), "connect %s", peer);
+	if (do_write(1, cmd, l) < 0) { fprintf(stderr, "connect failed\n"); return 1; }
+	fprintf(stderr, "[probe] conv %d connected to %s\n", conv, peer);
+	for (int i = 0; i < 8; i++) { if (do_read(2, 0, rb, sizeof(rb)) <= 0) break; }  /* drain stale */
+
+	/* inner 9P session to the PEER's mesh server, tunneled through the data fid */
+	o = 4; t[o++] = Tversion; p16(t + o, NOTAG); o += 2; p32(t + o, 480); o += 4;
+	p16(t + o, 6); o += 2; memcpy(t + o, "9P2000", 6); o += 6; p32(t, o);
+	if (inner_send_recv(t, o, rb, sizeof(rb), &rn, 40) != 1 || rb[4] != Rversion) {
+		fprintf(stderr, "[probe] inner Tversion failed (rn=%d)\n", rn); return 1; }
+	o = 4; t[o++] = Tattach; p16(t + o, 1); o += 2; p32(t + o, 0); o += 4; p32(t + o, NOFID); o += 4;
+	p16(t + o, 1); o += 2; t[o++] = 'p'; p16(t + o, 0); o += 2; p32(t, o);
+	if (inner_send_recv(t, o, rb, sizeof(rb), &rn, 40) != 1 || rb[4] != Rattach) {
+		fprintf(stderr, "[probe] inner Tattach failed\n"); return 1; }
+	o = 4; t[o++] = Twalk; p16(t + o, 2); o += 2; p32(t + o, 0); o += 4; p32(t + o, 1); o += 4;
+	{ const char *w[] = { "dev", "aether", "addr" }; p16(t + o, 3); o += 2;
+	  for (int i = 0; i < 3; i++) { int wl = strlen(w[i]); p16(t + o, wl); o += 2; memcpy(t + o, w[i], wl); o += wl; } }
+	p32(t, o);
+	if (inner_send_recv(t, o, rb, sizeof(rb), &rn, 40) != 1 || rb[4] != Rwalk) {
+		fprintf(stderr, "[probe] inner Twalk failed (type=%d)\n", rn > 4 ? rb[4] : -1); return 1; }
+	o = 4; t[o++] = Topen; p16(t + o, 3); o += 2; p32(t + o, 1); o += 4; t[o++] = OREAD; p32(t, o);
+	if (inner_send_recv(t, o, rb, sizeof(rb), &rn, 40) != 1 || rb[4] != Ropen) {
+		fprintf(stderr, "[probe] inner Topen failed\n"); return 1; }
+	fprintf(stderr, "[probe] inner session open; strict Tread x%d (one send, first reply, no tag-match)\n", count);
+
+	int clean = 0, loss = 0, mism = 0;
+	for (int i = 0; i < count; i++) {
+		uint16_t tag = (uint16_t)(1000 + i);
+		o = 4; t[o++] = Tread; p16(t + o, tag); o += 2; p32(t + o, 1); o += 4;
+		p32(t + o, 0); o += 4; p32(t + o, 0); o += 4; p32(t + o, 200); o += 4; p32(t, o);
+		int r = inner_send_recv(t, o, rb, sizeof(rb), &rn, 60);
+		if (r != 1) { loss++; continue; }
+		uint16_t rtag = g16(rb + 5);
+		if (rb[4] == Rread && rtag == tag) { clean++; }
+		else { mism++; if (mism <= 10) fprintf(stderr, "[probe] mismatch #%d: type=%d tag=%u (want %u)\n", mism, rb[4], rtag, tag); }
+	}
+	int tot = clean + loss + mism; if (tot == 0) tot = 1;
+	fprintf(stderr, "\n===== RAW-CHANNEL PROBE (%s, %d Treads, strict single-send, no tag-match) =====\n", peer, count);
+	fprintf(stderr, "  clean    : %d (%.1f%%)\n", clean, 100.0 * clean / tot);
+	fprintf(stderr, "  loss     : %d (%.1f%%)   <- would need RETRY\n", loss, 100.0 * loss / tot);
+	fprintf(stderr, "  mismatch : %d (%.1f%%)   <- would need TAG-MATCH\n", mism, 100.0 * mism / tot);
+	fprintf(stderr, "  verdict  : %s\n", (loss == 0 && mism == 0)
+		? "RAW-CLEAN -> transport_nsfile can be a dumb pipe"
+		: "NEEDS SHIM -> deck transport needs retry/tag-match");
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --recv | --put <path> <file> [chunk] | --bridge <peer> <listen-path>]\n", argv[0]);
+		fprintf(stderr, "usage: %s <unix-sock> [peer_addr | --concurrent | --hold | --recv | --put <path> <file> [chunk] | --bridge <peer> <listen-path> | --probe <peer> [count]]\n", argv[0]);
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: see progress even if a recv blocks */
@@ -697,7 +782,8 @@ int main(int argc, char **argv)
 	int asend = arg2 && strcmp(arg2, "--asend") == 0;
 	int put = arg2 && strcmp(arg2, "--put") == 0;
 	int bridge = arg2 && strcmp(arg2, "--bridge") == 0;
-	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || crecv || iso || sendn || sendbig || asend || bridge) ? NULL : arg2;
+	int probe = arg2 && strcmp(arg2, "--probe") == 0;
+	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || crecv || iso || sendn || sendbig || asend || bridge || probe) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -711,6 +797,10 @@ int main(int argc, char **argv)
 	if (bridge) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --bridge <peer_addr> <unix_listen_path>\n", argv[0]); return 2; }
 		return do_bridge(argv[3], argv[4]);
+	}
+	if (probe) {
+		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --probe <peer> [count]\n", argv[0]); return 2; }
+		return do_probe(argv[3], argc > 4 ? atoi(argv[4]) : 100);
 	}
 	if (hold) {
 		return do_hold();
