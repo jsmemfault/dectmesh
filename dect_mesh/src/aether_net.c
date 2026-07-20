@@ -29,9 +29,17 @@
 #include <zephyr/net/heymac.h>
 #include <zephyr/9p/server.h>
 #include <zephyr/9p/protocol.h>
+#include <zephyr/random/random.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+
+/* A best-effort broadcast is one-shot at the mesh layer, so a transient busy
+ * channel (LBT -EBUSY) would surface to the client as a send failure. Absorb it
+ * here with a short jittered busy-retry (backlog #3: transport tolerates
+ * transient RF). Reliable sends get the equivalent in aether_route.c. */
+#define NET_BCAST_BUSY_RETRIES    6
+#define NET_BCAST_BUSY_BACKOFF_MS 15
 
 LOG_MODULE_REGISTER(aether_net, LOG_LEVEL_INF);
 
@@ -568,8 +576,17 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 			if (count > CONFIG_AETHER_MAX_PAYLOAD) {
 				return -EMSGSIZE;
 			}
-			int ret = aether_mesh_send(g_fs.iface, bcast, buf, count,
-						   AETHER_PRIORITY_NORMAL);
+			/* Absorb a transient busy channel (LBT) before surfacing it: the
+			 * client (achat lobby) shouldn't see -EBUSY on a momentary busy. */
+			int ret = -EBUSY;
+			for (int b = 0; b < NET_BCAST_BUSY_RETRIES && ret == -EBUSY; b++) {
+				if (b > 0) {
+					k_msleep(NET_BCAST_BUSY_BACKOFF_MS +
+						 (sys_rand32_get() % NET_BCAST_BUSY_BACKOFF_MS));
+				}
+				ret = aether_mesh_send(g_fs.iface, bcast, buf, count,
+						       AETHER_PRIORITY_NORMAL);
+			}
 			if (ret < 0) {
 				g_fs.ctr.tx_err++;
 				return ret;
