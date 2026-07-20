@@ -361,6 +361,27 @@ static int do_bstatus(void)
 	return 0;
 }
 
+/* §6a broadcast SEND (exactly what achat does): clone, connect ff:ff:ff:ff:ff:ff
+ * (CONV_BCAST), then write a bare payload to N/data -> aether_mesh_send(bcast).
+ * Reports precisely which step fails. Holds the clone fid the whole time. */
+static int do_bsend(const char *msg)
+{
+	uint8_t rb[256];
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); return 1; }
+	if (do_walk(0, 1, "net/aether/clone") || do_open(1, ORDWR)) { fprintf(stderr, "clone failed\n"); return 1; }
+	int n = do_read(1, 0, rb, sizeof(rb) - 1); rb[n < 0 ? 0 : n] = 0; int conv = atoi((char *)rb);
+	if (do_write(1, "connect ff:ff:ff:ff:ff:ff", 25) < 0) { fprintf(stderr, "connect bcast FAILED\n"); do_clunk(1); do_clunk(0); return 1; }
+	char path[64]; snprintf(path, sizeof(path), "net/aether/%d/data", conv);
+	if (do_walk(0, 2, path) || do_open(2, ORDWR)) { fprintf(stderr, "data open FAILED\n"); do_clunk(1); do_clunk(0); return 1; }
+	int ml = (int)strlen(msg);
+	if (do_write(2, msg, ml) < 0)
+		fprintf(stderr, "[bsend] DATA WRITE FAILED (conv %d) -- the mesh send was rejected\n", conv);
+	else
+		printf("[bsend] conv %d broadcast-sent %d bytes OK: %s\n", conv, ml, msg);
+	do_clunk(2); do_clunk(1); do_clunk(0);
+	return 0;
+}
+
 /* §6a broadcast receiver: clone, connect ff:ff:ff:ff:ff:ff (CONV_BCAST), then
  * hold one session and read up to `count` source-prefixed broadcast datagrams.
  * Mirrors do_recv but joins the party line instead of announcing -- this is the
@@ -775,6 +796,7 @@ int main(int argc, char **argv)
 	int recv = arg2 && strcmp(arg2, "--recv") == 0;
 	int brecv = arg2 && strcmp(arg2, "--brecv") == 0;
 	int bstatus = arg2 && strcmp(arg2, "--bstatus") == 0;
+	int bsend = arg2 && strcmp(arg2, "--bsend") == 0;
 	int crecv = arg2 && strcmp(arg2, "--crecv") == 0;
 	int iso = arg2 && strcmp(arg2, "--iso") == 0;
 	int sendn = arg2 && strcmp(arg2, "--sendn") == 0;
@@ -783,7 +805,7 @@ int main(int argc, char **argv)
 	int put = arg2 && strcmp(arg2, "--put") == 0;
 	int bridge = arg2 && strcmp(arg2, "--bridge") == 0;
 	int probe = arg2 && strcmp(arg2, "--probe") == 0;
-	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || crecv || iso || sendn || sendbig || asend || bridge || probe) ? NULL : arg2;
+	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || bsend || crecv || iso || sendn || sendbig || asend || bridge || probe) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
@@ -813,6 +835,10 @@ int main(int argc, char **argv)
 	}
 	if (bstatus) {
 		return do_bstatus();                            /* --bstatus */
+	}
+	if (bsend) {
+		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --bsend <msg>\n", argv[0]); return 2; }
+		return do_bsend(argv[3]);
 	}
 	if (crecv) {
 		if (argc < 4) { fprintf(stderr, "usage: %s <sock> --crecv <peer_addr>\n", argv[0]); return 2; }
