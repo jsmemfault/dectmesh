@@ -309,10 +309,27 @@ static int dfu_write_confirm(const uint8_t *buf, uint32_t count, uint64_t off, v
 static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 {
 	ARG_UNUSED(bytes);
+	/* Quiesce the DECT mesh while firmware streams over the inter-chip UART, so
+	 * the low-priority flash-write thread isn't starved by RX/HONR and a chunk's
+	 * Rwrite doesn't miss the relay's timeout ("write failed"). Released on
+	 * complete/error; the node reboots to apply. This is the "RF must never block
+	 * a wired OTA" guarantee. See aether_mesh_set_dfu_active. */
 	switch (state) {
-	case NINEP_DFU_ERASING:  LOG_INF("fw9151 DFU: erasing secondary slot (external flash)"); break;
-	case NINEP_DFU_COMPLETE: LOG_INF("fw9151 DFU: complete - reboot to apply"); break;
-	case NINEP_DFU_ERROR:    LOG_ERR("fw9151 DFU: error %d", err); break;
+	case NINEP_DFU_ERASING:
+		aether_mesh_set_dfu_active(true);
+		LOG_INF("fw9151 DFU: erasing secondary slot (external flash); mesh quiesced");
+		break;
+	case NINEP_DFU_RECEIVING:
+		aether_mesh_set_dfu_active(true);  /* in case ERASING was skipped */
+		break;
+	case NINEP_DFU_COMPLETE:
+		aether_mesh_set_dfu_active(false);
+		LOG_INF("fw9151 DFU: complete - reboot to apply; mesh resumed");
+		break;
+	case NINEP_DFU_ERROR:
+		aether_mesh_set_dfu_active(false);
+		LOG_ERR("fw9151 DFU: error %d; mesh resumed", err);
+		break;
 	default: break;
 	}
 }
