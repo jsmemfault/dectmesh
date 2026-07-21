@@ -34,6 +34,7 @@
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/union_fs.h>
 #include <zephyr/9p/remote_fs.h>
+#include "aether_conv_transport.h"
 #include <zephyr/9p/dfu.h>
 #include <zephyr/9p/client.h>
 #include <zephyr/9p/transport_uart.h>
@@ -234,12 +235,32 @@ static struct ninep_dfu fw_dfu;
  * host and BLE 9P clients alike.
  */
 static struct ninep_union_fs fw_union;
-static struct ninep_union_mount fw_union_mounts[2];
+static struct ninep_union_mount fw_union_mounts[3];   /* / + /net/aether + /net/mesh */
 static struct ninep_remote_fs aether_rfs;
 /* One node per concurrently-walked fid under /net/aether. The 9151 caps at
  * AETHER_MAX_CONNS conversations; each uses a handful of fids (clone/ctl/data/
  * dir/status) plus dir-listing walks -- 24 covers all four with headroom. */
 static struct ninep_remote_node aether_rnodes[24];
+
+/* --- Modem-side mesh remote-mount: re-export a REMOTE node's fs at /net/mesh so
+ * a dumb 9P client (macOS 9pfuse, plan9port -- the demo majority) browses it with
+ * NO client-side mesh code. A second remote_fs whose ninep_client dials over the
+ * mesh (aether_conv_transport tunnels the nested 9P through a /net/aether
+ * conversation on the 9151) instead of the inter-chip UART. Target peer set by
+ * writing dev/mesh_peer. See doc/MESH_REMOTE_MOUNT.md. */
+static struct aether_conv_transport mesh9p_transport;
+static struct ninep_client mesh9p_client;
+static const struct ninep_client_config mesh9p_client_cfg = {
+	.max_message_size = AETHER_CONV_MTU,   /* one nested 9P msg == one mesh datagram */
+	.version = "9P2000",
+	.timeout_ms = 6000,                    /* mesh round-trip + starved 9151 server */
+};
+static struct ninep_remote_fs mesh_rfs;
+static struct ninep_remote_node mesh_rnodes[16];
+static char g_mesh_peer[24];               /* target addr string; empty = unset */
+static uint32_t mesh9p_root_fid;
+static bool mesh9p_attached;               /* nested version+attach to the remote done */
+static struct k_mutex mesh9p_sess;
 
 static int fw_write_reboot(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
 {
@@ -586,6 +607,120 @@ static void mesh_remote_down(void *user)
 	k_mutex_lock(&mesh_sess, K_FOREVER);
 	mesh_attached = false;
 	k_mutex_unlock(&mesh_sess);
+}
+
+/* --- remote_fs hooks for the /net/mesh re-export (the NESTED layer) ---------
+ * root_fn: ensure the OUTER 9151 link is up, open+connect a /net/aether
+ * conversation to g_mesh_peer, then version+attach the nested client (which
+ * tunnels to that peer's mesh 9P server) and hand back its remote root fid.
+ * down_fn: drop the nested attach + the conversation so the next root_fn redials.
+ */
+static int mesh9p_remote_root(uint32_t *root, void *user)
+{
+	uint32_t carrier_root;
+	int ret;
+
+	ARG_UNUSED(user);
+
+	k_mutex_lock(&mesh9p_sess, K_FOREVER);
+	if (g_mesh_peer[0] == '\0') {
+		k_mutex_unlock(&mesh9p_sess);
+		return -ENOTCONN;   /* no peer selected -- write dev/mesh_peer first */
+	}
+	if (mesh9p_attached) {
+		*root = mesh9p_root_fid;
+		k_mutex_unlock(&mesh9p_sess);
+		return 0;
+	}
+
+	ret = mesh_ensure_attached(&carrier_root);      /* outer 9151 link */
+	if (ret < 0) {
+		k_mutex_unlock(&mesh9p_sess);
+		return ret;
+	}
+	ret = aether_conv_transport_connect(&mesh9p_transport, carrier_root, g_mesh_peer);
+	if (ret < 0) {
+		k_mutex_unlock(&mesh9p_sess);
+		return ret;
+	}
+	/* Nested handshake to the REMOTE node's mesh 9P server (tunneled). */
+	ret = ninep_client_version(&mesh9p_client);
+	if (ret < 0) {
+		LOG_WRN("/net/mesh: nested Tversion to %s failed: %d", g_mesh_peer, ret);
+		k_mutex_unlock(&mesh9p_sess);
+		return ret;
+	}
+	ret = ninep_client_attach(&mesh9p_client, &mesh9p_root_fid, NINEP_NOFID, "relay", "");
+	if (ret < 0) {
+		LOG_WRN("/net/mesh: nested Tattach to %s failed: %d", g_mesh_peer, ret);
+		k_mutex_unlock(&mesh9p_sess);
+		return ret;
+	}
+	mesh9p_attached = true;
+	*root = mesh9p_root_fid;
+	LOG_INF("/net/mesh: attached to remote %s (root fid %u)", g_mesh_peer, mesh9p_root_fid);
+	k_mutex_unlock(&mesh9p_sess);
+	return 0;
+}
+
+static void mesh9p_remote_down(void *user)
+{
+	ARG_UNUSED(user);
+	k_mutex_lock(&mesh9p_sess, K_FOREVER);
+	mesh9p_attached = false;
+	k_mutex_unlock(&mesh9p_sess);
+	aether_conv_transport_disconnect(&mesh9p_transport);
+}
+
+/* dev/mesh_peer -- write a target addr ("30:00" shorthand or full
+ * "00:00:00:00:30:00") to point /net/mesh at that node. Drops any current
+ * conversation so the next /net/mesh access dials the new peer. */
+static int fw_write_mesh_peer(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	char in[24], full[24];
+	uint32_t k = MIN(count, sizeof(in) - 1);
+
+	ARG_UNUSED(off); ARG_UNUSED(ctx);
+	memcpy(in, buf, k);
+	in[k] = '\0';
+	while (k && (in[k - 1] == '\n' || in[k - 1] == '\r' || in[k - 1] == ' ')) {
+		in[--k] = '\0';
+	}
+	/* "HH:LL" shorthand -> a full 6-byte HONR address. */
+	if (k > 0 && k <= 5) {
+		(void)snprintf(full, sizeof(full), "00:00:00:00:%s", in);
+	} else {
+		strncpy(full, in, sizeof(full) - 1);
+		full[sizeof(full) - 1] = '\0';
+	}
+
+	k_mutex_lock(&mesh9p_sess, K_FOREVER);
+	strncpy(g_mesh_peer, full, sizeof(g_mesh_peer) - 1);
+	g_mesh_peer[sizeof(g_mesh_peer) - 1] = '\0';
+	mesh9p_attached = false;
+	k_mutex_unlock(&mesh9p_sess);
+	aether_conv_transport_disconnect(&mesh9p_transport);
+
+	LOG_INF("mesh_peer set to %s (next /net/mesh access dials it)", full);
+	return count;
+}
+
+/* dev/mesh_peer read -- report the current target (or "unset"). */
+static int mesh_peer_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	char tmp[32];
+	int len;
+
+	ARG_UNUSED(ctx);
+	k_mutex_lock(&mesh9p_sess, K_FOREVER);
+	len = snprintf(tmp, sizeof(tmp), "%s\n", g_mesh_peer[0] ? g_mesh_peer : "unset");
+	k_mutex_unlock(&mesh9p_sess);
+	if (len < 0 || off >= (uint64_t)len) {
+		return 0;
+	}
+	size_t n = MIN(buf_size, (size_t)len - (size_t)off);
+	memcpy(buf, tmp + (size_t)off, n);
+	return (int)n;
 }
 
 /*
@@ -1126,6 +1261,11 @@ static int fw_9p_init(void)
 						    fw9151auto_read, fw9151auto_write,
 						    NULL, NULL);
 
+	/* dev/mesh_peer: point /net/mesh at a remote node. Write "30:00" (shorthand)
+	 * or a full "00:00:00:00:30:00"; read shows the current target. */
+	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/mesh_peer",
+						 mesh_peer_read, fw_write_mesh_peer, NULL);
+
 	/* dev/aether/*: the 9151's mesh node-state, proxied read-only over the
 	 * mesh link so the host can watch the DECT mesh form + route (neighbors,
 	 * routes, tree, rank, ...); chat is the writable party-line. Mirrors the
@@ -1180,6 +1320,33 @@ static int fw_9p_init(void)
 	if (qid_salt != 0) {
 		ninep_remote_fs_set_qid_salt(&aether_rfs, qid_salt);
 	}
+
+	/* Modem-side mesh remote-mount: a SECOND remote_fs whose nested client dials
+	 * over the mesh (aether_conv_transport tunnels through a /net/aether
+	 * conversation on the SAME mesh_client/UART), re-exported at /net/mesh. base
+	 * "" = the remote node's whole tree (its dev + net). Target set by dev/mesh_peer. */
+	k_mutex_init(&mesh9p_sess);
+	err = aether_conv_transport_init(&mesh9p_transport, &mesh_client);
+	if (err) {
+		LOG_ERR("mesh9p transport init: %d", err);
+		return err;
+	}
+	err = ninep_client_init(&mesh9p_client, &mesh9p_client_cfg, &mesh9p_transport.transport);
+	if (err) {
+		LOG_ERR("mesh9p client init: %d", err);
+		return err;
+	}
+	err = ninep_remote_fs_init(&mesh_rfs, &mesh9p_client, "",
+				   mesh_rnodes, ARRAY_SIZE(mesh_rnodes),
+				   mesh9p_remote_root, mesh9p_remote_down, NULL);
+	if (err) {
+		LOG_ERR("/net/mesh remote_fs init: %d", err);
+		return err;
+	}
+	if (qid_salt != 0) {
+		ninep_remote_fs_set_qid_salt(&mesh_rfs, qid_salt + 0x1000);
+	}
+
 	err = ninep_union_fs_init(&fw_union, fw_union_mounts,
 				  ARRAY_SIZE(fw_union_mounts));
 	if (err) {
@@ -1195,6 +1362,12 @@ static int fw_9p_init(void)
 				   ninep_remote_fs_get_ops(), &aether_rfs);
 	if (err) {
 		LOG_ERR("union mount /net/aether: %d", err);
+		return err;
+	}
+	err = ninep_union_fs_mount(&fw_union, "/net/mesh",
+				   ninep_remote_fs_get_ops(), &mesh_rfs);
+	if (err) {
+		LOG_ERR("union mount /net/mesh: %d", err);
 		return err;
 	}
 

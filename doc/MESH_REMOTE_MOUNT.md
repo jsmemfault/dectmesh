@@ -17,10 +17,13 @@ This is the on-device home for the one piece the 9P-over-mesh demo ran on the ho
 (`tools/aether_conv --bridge`), so a dumb client gets remote mounts *seamlessly*
 instead of having to run that bridge tool by hand. Everything else already exists.
 
-**Status: NOT built.** The reference implementation (`aether_conv_transport.c`)
-was drafted then set aside; this remains a spec. The three client paths:
-`transport_nsfile` (deck, built) · this modem-side re-export (dumb clients, unbuilt)
-· `aether_conv --bridge` (host tool, works today as the manual stopgap).
+**Status: BUILT (relay 0.38.20), not yet hardware-tested.** `aether_conv_transport.c`
++ the `/net/mesh` re-export are wired into `main.c` (peer set via `dev/mesh_peer`,
+MVP Phase 1). The three client paths: `transport_nsfile` (deck, built) · this
+modem-side re-export (dumb clients, **built** — gate on §7 step 2) · `aether_conv
+--bridge` (host tool, works today as the manual stopgap). NOTE: Phase 1 shipped as
+`dev/mesh_peer` + a fixed `/net/mesh` mount (not `/net/mesh/ctl` + `/net/mesh/node/`
+— same behavior, one writable control file instead of a `ctl` node).
 
 ---
 
