@@ -1,0 +1,131 @@
+#!/usr/bin/env rc
+# aether.rc -- Aether mesh chat as a pure plan9port rc client, over a
+# 9pfuse-mounted modem's /net/aether. No custom binary: just held-fid file I/O,
+# the same clone->ctl->data dance achat / `aether_conv --bridge` do on the host
+# and the deck achat will do on-device. Because it's stdin->send / recv->stdout,
+# it doubles as the e2e test driver for the chat/datagram layer (see TESTING).
+#
+# usage:
+#   aether.rc [-m mount-root] [-l secs] [addr | bcast]
+#
+#   aether.rc                     interactive broadcast party line (mount /tmp/aether)
+#   aether.rc 30:00               connected (reliable) chat to node 3000
+#   echo hi | aether.rc bcast     send one datagram, then hang up (pipe/sender mode)
+#   aether.rc -l 8 bcast          LISTEN 8s: print every datagram to stdout, ignore
+#                                 stdin, then hang up (receiver / test-assert side)
+#   aether.rc -m /tmp/aetherb 30:00     use a second mount (multi-node on one host)
+#
+# Lines you type (or pipe) are sent one datagram each. Incoming datagrams print
+# one per line to stdout; broadcast/announced modes carry a [src] prefix. Status
+# goes to stderr, so stdout is a clean message stream you can diff in a test.
+# Ctrl-D / EOF (or -l expiry) hangs up; closing the held ctl fid frees the
+# conversation upstream and wakes the reader with the firmware's EOF sentinel.
+#
+# rc note: an fd is held open only for the lifetime of a { } block it is
+# redirected onto -- there is no Bourne-style `exec 3<>file`. So the whole
+# session lives inside a block redirected `<>[3] clone`: fd 3 is the ctl fid,
+# held until the block ends == the hang-up.
+
+fn usage {
+	echo 'usage: aether.rc [-m mount-root] [-l secs] [addr|bcast]' >[1=2]
+	exit usage
+}
+
+# --- args -----------------------------------------------------------------
+mroot=/tmp/aether        # matches tools/mount-term.sh default mount point
+listen=()                # set by -l: seconds to receive before hanging up
+peer=()
+while(! ~ $#* 0){
+	switch($1){
+	case -m
+		mroot=$2; shift
+	case -l
+		listen=$2; shift
+	case -h --help
+		usage
+	case -*
+		usage
+	case *
+		peer=$1
+	}
+	shift
+}
+~ $#peer 0 && peer=bcast
+
+# shorthand: bcast -> broadcast addr; HH:LL -> 00:00:00:00:HH:LL; full addr as-is
+if(~ $peer bcast broadcast)
+	dst=ff:ff:ff:ff:ff:ff
+if not if(~ $peer *:*:*:*:*:*)
+	dst=$peer
+if not if(~ $peer *:*)
+	dst=00:00:00:00:^$peer
+if not
+	usage
+
+aeth=$mroot/net/aether
+if(! test -e $aeth/clone){
+	echo aether.rc: $aeth/clone not found '--' is the modem mounted at $mroot'?' >[1=2]
+	exit nomount
+}
+
+ifs='
+'   # read one whole line per datagram (do not word-split payloads)
+
+# The session lives inside this block; fd 3 (redirected below) is the held ctl
+# fid. Opening `clone` allocates conv N; reading fd 3 yields N; writing fd 3 is
+# the ctl channel. The block ending closes fd 3 == the canonical hang-up.
+{
+	conv=`{read <[0=3]}
+	if(~ $#conv 0){
+		echo aether.rc: clone returned no conversation number >[1=2]
+		exit clone
+	}
+	echo connect $dst >[1=3]        # fd 3 == ctl: join party line / dial the peer
+	data=$aeth/$conv/data
+	echo aether.rc: conv $conv connected to $dst >[1=2]
+
+	# reader: each `data` read blocks for one datagram (or the EOF sentinel).
+	# Own fd 4 (its own block redirect) so it never contends with the writer;
+	# backgrounded so send and receive run concurrently.
+	{
+		while(line=`{read <[0=4]})
+			echo $line
+	} <>[4] $data &
+
+	if(! ~ $#listen 0){
+		# receiver / test-assert mode: hold the conversation for the window,
+		# ignore stdin, stream incoming datagrams to stdout, then hang up.
+		sleep $listen
+	}
+	if not{
+		# interactive / sender mode: stdin -> one datagram per line, own fd 5.
+		{
+			while(line=`{read})
+				echo $line >[1=5]
+		} <>[5] $data
+	}
+} <>[3] $aeth/clone
+
+# Block exit closes fd 3: the ctl clunk frees the conversation upstream, and
+# conv_free's len-0 sentinel wakes the backgrounded reader so it exits too.
+# Normal completion is success -- don't leak the reader/sender loop's EOF status
+# (a test harness checks $status; error paths above exit before reaching here).
+exit ''
+
+# TESTING -- e2e chat/datagram layer, carrying the 9P-session suite forward.
+# stdin->send / recv->stdout makes this the test driver; the same rc achat the
+# deck runs. Two mounts (two nodes on one host, or two hosts), diff the stream:
+#
+#   # node B listens for 6s, capturing whatever lands on the party line
+#   aether.rc -m /tmp/aetherB -l 6 bcast >got.txt &
+#   sleep 1                                  # let B's conversation attach
+#   # node A sends three datagrams, then hangs up
+#   {echo one; echo two; echo three} | aether.rc -m /tmp/aetherA bcast
+#   wait
+#   # assert: B saw all three (broadcast reads are [src]-prefixed)
+#   grep -c ' one$| two$| three$' got.txt    # expect 3
+#
+# Directed (reliable) instead of broadcast: A -> `aether.rc 30:00`, B listens on
+# its own node addr. Slots to remember: AETHER_MAX_CONNS=4 per node, so tear each
+# invocation down (it does, on exit) before opening the next. Wire this into
+# tools/run_aether_suite.sh as the chat phase alongside the 9P-session phases.
