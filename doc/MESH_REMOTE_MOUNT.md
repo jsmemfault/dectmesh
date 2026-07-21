@@ -17,13 +17,15 @@ This is the on-device home for the one piece the 9P-over-mesh demo ran on the ho
 (`tools/aether_conv --bridge`), so a dumb client gets remote mounts *seamlessly*
 instead of having to run that bridge tool by hand. Everything else already exists.
 
-**Status: BUILT (relay 0.38.20), not yet hardware-tested.** `aether_conv_transport.c`
-+ the `/net/mesh` re-export are wired into `main.c` (peer set via `dev/mesh_peer`,
-MVP Phase 1). The three client paths: `transport_nsfile` (deck, built) · this
-modem-side re-export (dumb clients, **built** — gate on §7 step 2) · `aether_conv
---bridge` (host tool, works today as the manual stopgap). NOTE: Phase 1 shipped as
-`dev/mesh_peer` + a fixed `/net/mesh` mount (not `/net/mesh/ctl` + `/net/mesh/node/`
-— same behavior, one writable control file instead of a `ctl` node).
+**Status: WORKING end-to-end on hardware (relay 0.38.21, 2026-07-21).** §7 step 2
++ step 4 passed: on the bridge node set `dev/mesh_peer=00:00:00:00:40:00`,
+`9p ls /net/mesh` → `dev net`, `read /net/mesh/net/aether/addr` → the target's own
+durable identity across the radio. The three client paths: `transport_nsfile`
+(deck, built) · this modem-side re-export (dumb clients, **proven**) · `aether_conv
+--bridge` (host tool, the manual predecessor). Phase 1 shipped as `dev/mesh_peer` +
+a fixed `/net/mesh` mount (not `/net/mesh/ctl` + `/net/mesh/node/` — same behavior,
+one writable control file). NB the pump thread needs an 8192 stack (0.38.20's 2048
+overflowed the MPU guard on first access → fault; fixed in 0.38.21).
 
 ---
 
