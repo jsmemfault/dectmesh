@@ -4,6 +4,12 @@ Deck-side recipe for browsing a **remote** node's 9P filesystem over the mesh,
 using `transport_nsfile` (9p4z `b29043f`). This is the on-deck equivalent of the
 host tool `aether_conv --bridge`.
 
+**This is the path for a full 9p4z client (a cyberdeck)** that can run its own
+transport. A **dumb client** — a macOS host over `l2cat`+`9pfuse`, a phone, etc.,
+the majority of demo users — can't, and instead wants the *modem* to re-export
+remote nodes: see **[MESH_REMOTE_MOUNT.md](MESH_REMOTE_MOUNT.md)**. Same
+`aether!<addr>` goal, resolved on the opposite side of the L2CAP link.
+
 ## The pieces (all already on the deck)
 
 - `bind l2cap!dect-modem` → the modem's `/net/aether` conversation interface in
