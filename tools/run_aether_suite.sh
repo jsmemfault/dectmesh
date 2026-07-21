@@ -7,6 +7,7 @@
 #   Phase 2  two-node datagram delivery      (tools/aether_conv, A <-> B)
 #   Phase 5  forced multi-hop topology       (aether deny/allow, A <-> B)
 #   Phase 6  multi-hop chat conversation     (A <-> DK <-> B, mutually denied)
+#   Phase 7  deck-path chat over 9pfuse       (rc achat, opt-in: CHAT_RC=1)
 #
 # Auto-detects two Thingy:91 X 9P ports (/dev/cu.usbmodem*3), brings up socats,
 # waits for the mesh to converge to distinct addresses, runs the battery, and
@@ -434,6 +435,28 @@ echo "  restoring: allowing B on A, A on B (keep denylist from filling across ru
 console_cmd "$CA" "aether allow $DB" 4 >/dev/null
 console_cmd "$CB" "aether allow $DA" 4 >/dev/null
 settle
+
+# ==========================================================================
+# Phase 7 (opt-in): the DECK-SHAPED chat path -- rc achat (tools/aether.rc) over
+# 9pfuse mounts, instead of the C aether_conv over socat. Same chat/datagram
+# layer, reached the way a dumb macOS/plan9port client (or the on-device deck
+# achat) reaches it. OFF by default (CHAT_RC=1 to enable): it needs 9pfuse AND
+# exclusive CDC ownership, so the suite's socats are torn down first -- two
+# openers on one CDC is exactly the broken-pipe class we avoid. The sub-script
+# owns its own mount lifecycle + cleanup; we fold its result into the summary.
+FUSE7="$HOME/src/plan9port/bin/9pfuse"
+if [ "${CHAT_RC:-0}" = 1 ] && [ -x "$FUSE7" ]; then
+  echo; echo "########## Phase 7: deck-path chat (rc achat over 9pfuse) ##########"
+  pkill -f 'socat.*usbmodem' 2>/dev/null; sleep 2   # release the suite's CDC owners
+  if PORTS="${PORTS[*]}" bash "$HERE/aether_chat_test.sh"; then
+    ok "deck-path chat (rc achat over 9pfuse): all mount-path chat checks passed"
+  else
+    no "deck-path chat (rc achat over 9pfuse)" "mount-path chat check(s) failed -- see Phase 7 detail above"
+  fi
+else
+  echo; echo "########## Phase 7: deck-path chat (rc achat over 9pfuse) -- skipped ##########"
+  echo "  set CHAT_RC=1 (with plan9port 9pfuse + macFUSE) to run the rc-achat mount path"
+fi
 
 # ==========================================================================
 echo; echo "########## SUMMARY ##########"
