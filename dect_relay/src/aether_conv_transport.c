@@ -18,7 +18,12 @@
 
 LOG_MODULE_REGISTER(aether_conv_tp, LOG_LEVEL_INF);
 
-#define PUMP_STACK 2048
+/* The pump runs the CARRIER ninep_client write+read AND the nested client's
+ * recv_cb decode (recv_cb fires on this thread) -- the same class of work the
+ * relay's proxy work queue gets 16384 for. 2048 overflowed the MPU stack guard
+ * on the first /net/mesh access (fault -> reboot); 8192 gives comfortable
+ * headroom for one carrier round-trip + the nested R decode. */
+#define PUMP_STACK 8192
 #define TX_ATTEMPTS 8   /* resend a lost T this many times (do_bridge used 4 on USB) */
 #define RX_POLLS    6   /* reads per attempt while awaiting the reply datagram */
 #define RX_POLL_MS  30  /* gap before re-reading an empty data fid (mesh round-trip) */
