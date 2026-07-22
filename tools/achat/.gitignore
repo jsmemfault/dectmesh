@@ -1,2 +1,4 @@
 achat-core
+achat-gui
 *.o
+achat.app/

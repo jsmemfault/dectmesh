@@ -18,6 +18,8 @@
 #include <9pclient.h>
 
 extern int serial_open(char*);
+extern char *serial_autodetect(void);
+extern void bundle_setup(void);   /* set DEVDRAW/PLAN9 from the .app if bundled */
 
 /* ---- transport core (mirrors achat_core.c) ------------------------------ */
 static CFsys *fs;
@@ -273,7 +275,7 @@ key(Rune r)
 void
 threadmain(int argc, char **argv)
 {
-	char *port = "/dev/cu.usbmodem1203";
+	char *port = nil;
 	char *dst  = "ff:ff:ff:ff:ff:ff";
 	char nb[32], cmd[64], path[64], banner[128];
 	int fd, conv, ai = 1;
@@ -285,6 +287,10 @@ threadmain(int argc, char **argv)
 
 	if(argc > ai){ port = argv[ai]; ai++; }
 	if(argc > ai){ dst  = argv[ai]; ai++; }
+	if(port == nil && (port = serial_autodetect()) == nil)
+		sysfatal("no 9P port found (/dev/cu.usbmodem*03); pass one explicitly");
+
+	bundle_setup();   /* if running inside achat.app, point libdraw at bundled devdraw+fonts */
 
 	/* --- UI FIRST --- initdraw spawns devdraw via fork() (libdraw drawclient.c).
 	 * It MUST run before fsmount creates the lib9pclient mux's ioproc threads:
