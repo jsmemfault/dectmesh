@@ -169,7 +169,26 @@ threadmain(int argc, char **argv)
 	if(argc > ai){ port = argv[ai]; ai++; }
 	if(argc > ai){ dst  = argv[ai]; ai++; }
 
-	/* --- transport (identical to achat_core.c) --- */
+	/* --- UI FIRST --- initdraw spawns devdraw via fork() (libdraw drawclient.c).
+	 * It MUST run before fsmount creates the lib9pclient mux's ioproc threads:
+	 * forking a process that already has those threads corrupts the mux, and the
+	 * reader's first fsread then fails immediately ([read error], one-sided chat). */
+	if(initdraw(nil, nil, "achat") < 0)
+		sysfatal("initdraw: %r");
+	if((mc = initmouse(nil, screen)) == nil)
+		sysfatal("initmouse: %r");
+	if((kc = initkeyboard(nil)) == nil)
+		sysfatal("initkeyboard: %r");
+	back  = display->black;
+	txt   = display->white;
+	mecol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreen);
+	if(mecol == nil) mecol = txt;
+	incoming = chancreate(sizeof(char*), 32);
+	layout();
+	addline("[achat] connecting...");
+	redraw();
+
+	/* --- transport (identical to achat_core.c), AFTER devdraw is forked --- */
 	fd = serial_open(port);
 	if(fd < 0)
 		sysfatal("open %s: %r", port);
@@ -195,21 +214,6 @@ threadmain(int argc, char **argv)
 	if(dataR == nil || dataW == nil)
 		sysfatal("open %s: %r", path);
 
-	/* --- UI --- */
-	if(initdraw(nil, nil, "achat") < 0)
-		sysfatal("initdraw: %r");
-	if((mc = initmouse(nil, screen)) == nil)
-		sysfatal("initmouse: %r");
-	if((kc = initkeyboard(nil)) == nil)
-		sysfatal("initkeyboard: %r");
-
-	back  = display->black;
-	txt   = display->white;
-	mecol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreen);
-	if(mecol == nil) mecol = txt;
-
-	incoming = chancreate(sizeof(char*), 32);
-	layout();
 	snprint(banner, sizeof banner, "[achat] conv %d on %s -- type + Enter; ^D quits", conv, dst);
 	addline(banner);
 	redraw();
