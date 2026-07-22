@@ -49,7 +49,12 @@ LOG_MODULE_REGISTER(aether_net, LOG_LEVEL_INF);
  * actually carry (no "9P accepts it but the mesh rejects it" gap). DECT-sized,
  * not the old 512 LoRa-era value. */
 #define AETHER_MAX_MSG     CONFIG_AETHER_MAX_PAYLOAD
-#define AETHER_RXQ_DEPTH   4
+/* Per-conversation RX datagram queue. Was 4 -- too shallow: under chat load the
+ * mesh delivers datagrams faster than the 9P client drains them (the 9P framer/
+ * async-read path is preempted by the COOP(2) mesh workq), so the queue filled at
+ * 4 and dropped ("conv N rxq full, dropping datagram"), degrading delivery. 16
+ * absorbs realistic bursts while the client catches up in the mesh-idle gaps. */
+#define AETHER_RXQ_DEPTH   16
 #define AETHER_NET_RETRIES 3     /* reliable-send retry budget (DECT PHY also helps) */
 
 /* One received datagram queued for a conversation's data reader. */
