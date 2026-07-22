@@ -41,6 +41,38 @@ static Channel *quitc;               /* note handler -> clean shutdown */
 static Channel *tickc;               /* watchdog heartbeat -> detect a dead devdraw */
 static char nick[64];                /* /nick prefix on outgoing messages */
 static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
+static char g_dst[24];               /* target addr, for re-connecting the conversation */
+static QLock convlk;                 /* guards the conversation fids: reconv vs send */
+
+/* Re-establish the conversation on the existing mount: the relay wipes held
+ * conversations when its 9151 link re-Tattaches destructively under load (a
+ * Tversion clunks every fid), so a mid-session read/write starts failing and the
+ * data node walks to "file not found". Re-clone -> re-connect -> reopen data, so
+ * the chat recovers instead of dying. Caller holds convlk. Returns 0 on success. */
+static int
+reconv(void)
+{
+	char nb[32], cmd[64];
+	long n;
+
+	if(ctl){ fsclose(ctl); ctl = nil; }
+	if(dataR){ fsclose(dataR); dataR = nil; }
+	if(dataW){ fsclose(dataW); dataW = nil; }
+
+	ctl = fsopen(fs, "net/aether/clone", ORDWR);
+	if(ctl == nil) return -1;
+	n = fsread(ctl, nb, sizeof nb - 1);
+	if(n <= 0) return -1;
+	nb[n] = 0;
+	conv = atoi(nb);
+	snprint(cmd, sizeof cmd, "connect %s", g_dst);
+	if(fswrite(ctl, cmd, strlen(cmd)) < 0) return -1;
+	snprint(datapath, sizeof datapath, "net/aether/%d/data", conv);
+	dataR = fsopen(fs, datapath, ORDWR);
+	dataW = fsopen(fs, datapath, ORDWR);
+	if(dataR == nil || dataW == nil) return -1;
+	return 0;
+}
 
 /* Clunk the ctl fid so the 9151 frees the conversation -- idempotent, and the
  * single choke point every exit path funnels through so the node never wedges. */
@@ -198,22 +230,23 @@ reader(void *a)
 	for(;;){
 		n = fsread(dataR, buf, sizeof buf);
 		if(n < 0){
-			/* Transient read failure (a flaky node's data plane): reopen the read
-			 * fid and keep going, so RX isn't permanently dead. Report only the
-			 * first hiccup; give up only if the reopen itself fails (conversation
-			 * really gone). */
+			/* The conversation was wiped mid-session (relay re-Tattach under load).
+			 * Fully re-clone it (fixes both dataR and dataW) and keep going -- don't
+			 * give up, so the chat self-heals. Report only the first hiccup and each
+			 * successful recovery. */
+			int r;
 			if(fails++ == 0){
 				snprint(out, sizeof out, "[rx hiccup: %r -- reconnecting]");
 				sendp(incoming, strdup(out));
 			}
-			if(dataR){ fsclose(dataR); dataR = nil; }
-			sleep(400);
-			dataR = fsopen(fs, datapath, ORDWR);
-			if(dataR == nil){
-				snprint(out, sizeof out, "[rx down: %r]");
-				sendp(incoming, strdup(out));
-				break;
-			}
+			sleep(500);
+			qlock(&convlk);
+			r = reconv();
+			qunlock(&convlk);
+			if(r < 0)
+				continue;   /* couldn't re-clone yet; back off (the sleep) and retry */
+			sendp(incoming, strdup("[reconnected]"));
+			fails = 0;
 			continue;
 		}
 		fails = 0;
@@ -287,8 +320,11 @@ sendline(void)
 		snprint(payload, sizeof payload, "%s: %s", nick, input);
 	else
 		snprint(payload, sizeof payload, "%s", input);
-	if(fswrite(dataW, payload, strlen(payload)) < 0)
-		addline("[send failed]");
+	qlock(&convlk);   /* don't send on dataW while the reader is re-cloning it */
+	long w = fswrite(dataW, payload, strlen(payload));
+	qunlock(&convlk);
+	if(w < 0)
+		addline("[send failed -- reconnecting]");   /* the reader will re-clone; retry the line */
 	else{
 		snprint(echo, sizeof echo, "[me] %s", input);
 		addline(echo);
@@ -385,6 +421,7 @@ threadmain(int argc, char **argv)
 	nb[n] = 0;
 	conv = atoi(nb);
 	g_bcast = (strcmp(dst, "ff:ff:ff:ff:ff:ff") == 0);
+	strncpy(g_dst, dst, sizeof g_dst - 1);   /* for reconv() */
 	snprint(cmd, sizeof cmd, "connect %s", dst);
 	if(fswrite(ctl, cmd, strlen(cmd)) < 0)
 		sysfatal("connect %s: %r", dst);
