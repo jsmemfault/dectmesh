@@ -42,6 +42,7 @@ static Channel *tickc;               /* watchdog heartbeat -> detect a dead devd
 static char nick[64];                /* /nick prefix on outgoing messages */
 static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
 static char g_dst[24];               /* target addr, for re-connecting the conversation */
+static int  conv;                    /* current conversation number */
 static QLock convlk;                 /* guards the conversation fids: reconv vs send */
 
 /* Re-establish the conversation on the existing mount: the relay wipes held
@@ -366,7 +367,7 @@ threadmain(int argc, char **argv)
 	char *port = nil;
 	char *dst  = "ff:ff:ff:ff:ff:ff";
 	char nb[32], cmd[64], banner[128];
-	int fd, conv, ai = 1;
+	int fd, ai = 1;
 	long n;
 	Mousectl *mc;
 	Keyboardctl *kc;
