@@ -37,6 +37,8 @@ static int   ninput;
 static Rectangle transr, inputr;
 static Image *back, *txt, *mecol;
 static Channel *incoming;            /* char* formatted lines from the reader proc */
+static Channel *quitc;               /* note handler -> clean shutdown */
+static Channel *tickc;               /* watchdog heartbeat -> detect a dead devdraw */
 static char nick[64];                /* /nick prefix on outgoing messages */
 static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
 
@@ -60,6 +62,34 @@ drawerr(Display *d, char *m)
 	fprint(2, "achat: draw error: %s\n", m);
 	hangup();
 	threadexitsall(nil);
+}
+
+/* Note handler: ctrl-C (interrupt) etc. used to hard-kill us WITHOUT clunking
+ * the conversation -> a leaked slot on the 9151 (only 4 exist) -> flaky sessions.
+ * Now it wakes the main loop to hang up cleanly. */
+static int
+noteh(void *v, char *note)
+{
+	USED(v);
+	if(strstr(note, "interrupt") || strstr(note, "hangup")
+	|| strstr(note, "term") || strstr(note, "kill")){
+		nbsendul(quitc, 1);
+		return 1;
+	}
+	return 0;
+}
+
+/* Watchdog: closing the window makes devdraw terminate (mac-screen.m:116), but a
+ * quiet event loop would just block forever (hence the ctrl-C). Tick the main
+ * loop so it flushimage()s periodically and notices the dead display -> clean exit. */
+static void
+watchdog(void *a)
+{
+	USED(a);
+	for(;;){
+		sleep(1000);
+		nbsendul(tickc, 1);
+	}
 }
 
 static void
@@ -306,6 +336,7 @@ threadmain(int argc, char **argv)
 	Keyboardctl *kc;
 	Rune r;
 	char *msg;
+	ulong qv;
 
 	if(argc > ai){ port = argv[ai]; ai++; }
 	if(argc > ai){ dst  = argv[ai]; ai++; }
@@ -330,6 +361,9 @@ threadmain(int argc, char **argv)
 	mecol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreen);
 	if(mecol == nil) mecol = txt;
 	incoming = chancreate(sizeof(char*), 32);
+	quitc = chancreate(sizeof(ulong), 2);
+	tickc = chancreate(sizeof(ulong), 2);
+	threadnotify(noteh, 1);   /* catch ctrl-C etc. -> clean hangup */
 	layout();
 	addline("[achat] connecting...");
 	redraw();
@@ -365,12 +399,15 @@ threadmain(int argc, char **argv)
 	redraw();
 
 	proccreate(reader, nil, 16384);
+	proccreate(watchdog, nil, 4096);
 
-	enum { AKEY, ARESIZE, AMSG, AEND };
+	enum { AKEY, ARESIZE, AMSG, AQUIT, ATICK, AEND };
 	Alt alts[] = {
 		[AKEY]    = { kc->c,       &r,   CHANRCV },
 		[ARESIZE] = { mc->resizec, nil,  CHANRCV },
 		[AMSG]    = { incoming,    &msg, CHANRCV },
+		[AQUIT]   = { quitc,       &qv,  CHANRCV },
+		[ATICK]   = { tickc,       &qv,  CHANRCV },
 		[AEND]    = { nil,         nil,  CHANEND },
 	};
 	for(;;){
@@ -379,8 +416,10 @@ threadmain(int argc, char **argv)
 			key(r);
 			break;
 		case ARESIZE:
-			if(getwindow(display, Refnone) < 0)
-				sysfatal("resize: %r");
+			if(getwindow(display, Refnone) < 0){   /* display gone -> hang up */
+				hangup();
+				threadexitsall(nil);
+			}
 			layout();
 			redraw();
 			break;
@@ -388,6 +427,15 @@ threadmain(int argc, char **argv)
 			addline(msg);
 			free(msg);
 			redraw();
+			break;
+		case AQUIT:            /* ctrl-C / term note */
+			hangup();
+			threadexitsall(nil);
+		case ATICK:            /* heartbeat: notice a closed window (dead devdraw) */
+			if(flushimage(display, 1) < 0){
+				hangup();
+				threadexitsall(nil);
+			}
 			break;
 		}
 	}
