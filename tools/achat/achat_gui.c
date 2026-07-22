@@ -38,6 +38,7 @@ static Rectangle transr, inputr;
 static Image *back, *txt, *mecol;
 static Channel *incoming;            /* char* formatted lines from the reader proc */
 static char nick[64];                /* /nick prefix on outgoing messages */
+static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
 
 /* Clunk the ctl fid so the 9151 frees the conversation -- idempotent, and the
  * single choke point every exit path funnels through so the node never wedges. */
@@ -161,10 +162,31 @@ reader(void *a)
 	char buf[LINEMAX], out[LINEMAX];
 	long n;
 
+	int fails = 0;
+
 	USED(a);
 	for(;;){
 		n = fsread(dataR, buf, sizeof buf);
-		if(n < 0){ snprint(out, sizeof out, "[read error: %r]"); sendp(incoming, strdup(out)); break; }
+		if(n < 0){
+			/* Transient read failure (a flaky node's data plane): reopen the read
+			 * fid and keep going, so RX isn't permanently dead. Report only the
+			 * first hiccup; give up only if the reopen itself fails (conversation
+			 * really gone). */
+			if(fails++ == 0){
+				snprint(out, sizeof out, "[rx hiccup: %r -- reconnecting]");
+				sendp(incoming, strdup(out));
+			}
+			if(dataR){ fsclose(dataR); dataR = nil; }
+			sleep(400);
+			dataR = fsopen(fs, datapath, ORDWR);
+			if(dataR == nil){
+				snprint(out, sizeof out, "[rx down: %r]");
+				sendp(incoming, strdup(out));
+				break;
+			}
+			continue;
+		}
+		fails = 0;
 		if(n == 0){ sendp(incoming, strdup("[hangup]")); break; }
 		if(g_bcast && n >= 6){
 			uchar *s = (uchar*)buf;
@@ -277,7 +299,7 @@ threadmain(int argc, char **argv)
 {
 	char *port = nil;
 	char *dst  = "ff:ff:ff:ff:ff:ff";
-	char nb[32], cmd[64], path[64], banner[128];
+	char nb[32], cmd[64], banner[128];
 	int fd, conv, ai = 1;
 	long n;
 	Mousectl *mc;
@@ -332,11 +354,11 @@ threadmain(int argc, char **argv)
 	snprint(cmd, sizeof cmd, "connect %s", dst);
 	if(fswrite(ctl, cmd, strlen(cmd)) < 0)
 		sysfatal("connect %s: %r", dst);
-	snprint(path, sizeof path, "net/aether/%d/data", conv);
-	dataR = fsopen(fs, path, ORDWR);
-	dataW = fsopen(fs, path, ORDWR);
+	snprint(datapath, sizeof datapath, "net/aether/%d/data", conv);
+	dataR = fsopen(fs, datapath, ORDWR);
+	dataW = fsopen(fs, datapath, ORDWR);
 	if(dataR == nil || dataW == nil)
-		sysfatal("open %s: %r", path);
+		sysfatal("open %s: %r", datapath);
 
 	snprint(banner, sizeof banner, "[achat] %s conv %d, party %s -- /help, ^D quits", port, conv, dst);
 	addline(banner);
