@@ -164,7 +164,7 @@ reader(void *a)
 	USED(a);
 	for(;;){
 		n = fsread(dataR, buf, sizeof buf);
-		if(n < 0){ sendp(incoming, strdup("[read error]")); break; }
+		if(n < 0){ snprint(out, sizeof out, "[read error: %r]"); sendp(incoming, strdup(out)); break; }
 		if(n == 0){ sendp(incoming, strdup("[hangup]")); break; }
 		if(g_bcast && n >= 6){
 			uchar *s = (uchar*)buf;
@@ -338,7 +338,7 @@ threadmain(int argc, char **argv)
 	if(dataR == nil || dataW == nil)
 		sysfatal("open %s: %r", path);
 
-	snprint(banner, sizeof banner, "[achat] conv %d on %s -- /help for commands, ^D quits", conv, dst);
+	snprint(banner, sizeof banner, "[achat] %s conv %d, party %s -- /help, ^D quits", port, conv, dst);
 	addline(banner);
 	redraw();
 
