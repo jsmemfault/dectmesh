@@ -1,0 +1,244 @@
+/*
+ * achat_gui.c -- a plan9port libdraw GUI for Aether mesh chat, step 2. Same
+ * native transport as achat_core.c (serial -> lib9pclient fsmount -> held
+ * /net/aether conversation, separate-fid reader proc), with a windowed UI:
+ * a scrollback transcript + an input line.
+ *
+ *   achat-gui /dev/cu.usbmodem1203 [dst-addr]
+ *
+ * Runs devdraw (the plan9port window server) for its Cocoa window -- so it must
+ * be launched from a GUI session, not a headless shell.
+ */
+#include <u.h>
+#include <libc.h>
+#include <draw.h>
+#include <thread.h>
+#include <mouse.h>
+#include <keyboard.h>
+#include <9pclient.h>
+
+extern int serial_open(char*);
+
+/* ---- transport core (mirrors achat_core.c) ------------------------------ */
+static CFsys *fs;
+static CFid  *ctl;     /* clone == ctl fid, held for the conversation */
+static CFid  *dataR;   /* reader fid */
+static CFid  *dataW;   /* writer fid (separate so blocked fsread != fswrite) */
+static int    g_bcast;
+
+/* ---- UI state ----------------------------------------------------------- */
+enum { MAXLINES = 400, LINEMAX = 1100, INPUTMAX = 512 };
+static char *ring[MAXLINES];
+static int   nlines;                 /* monotonic total; line k lives at ring[k%MAXLINES] */
+static char  input[INPUTMAX];
+static int   ninput;
+static Rectangle transr, inputr;
+static Image *back, *txt, *mecol;
+static Channel *incoming;            /* char* formatted lines from the reader proc */
+
+static void
+addline(char *s)
+{
+	int i = nlines % MAXLINES;
+	if(ring[i])
+		free(ring[i]);
+	ring[i] = strdup(s);
+	nlines++;
+}
+
+static void
+layout(void)
+{
+	Rectangle r = screen->r;
+	int ih = font->height + 6;
+	inputr = Rect(r.min.x, r.max.y - ih, r.max.x, r.max.y);
+	transr = Rect(r.min.x, r.min.y, r.max.x, inputr.min.y);
+}
+
+static void
+redraw(void)
+{
+	int nfit, start, i;
+	Point p;
+	char pbuf[INPUTMAX + 4];
+	Point after;
+
+	/* transcript: show the newest lines that fit, top-to-bottom */
+	draw(screen, transr, back, nil, ZP);
+	nfit = Dy(transr) / font->height;
+	start = nlines > nfit ? nlines - nfit : 0;
+	p = addpt(transr.min, Pt(3, 2));
+	for(i = start; i < nlines; i++){
+		char *ln = ring[i % MAXLINES];
+		Image *c = (strncmp(ln, "[me]", 4) == 0) ? mecol : txt;
+		string(screen, p, c, ZP, font, ln);
+		p.y += font->height;
+	}
+
+	/* input line, with a separator + block cursor */
+	draw(screen, inputr, back, nil, ZP);
+	line(screen, Pt(inputr.min.x, inputr.min.y), Pt(inputr.max.x, inputr.min.y),
+		0, 0, 0, txt, ZP);
+	snprint(pbuf, sizeof pbuf, "> %s", input);
+	after = string(screen, addpt(inputr.min, Pt(3, 3)), txt, ZP, font, pbuf);
+	draw(screen, Rect(after.x, after.y, after.x + 2, after.y + font->height), txt, nil, ZP);
+
+	flushimage(display, 1);
+}
+
+/* reader proc: one datagram per fsread -> format -> hand to the UI proc. */
+static void
+reader(void *a)
+{
+	char buf[LINEMAX], out[LINEMAX];
+	long n;
+
+	USED(a);
+	for(;;){
+		n = fsread(dataR, buf, sizeof buf);
+		if(n < 0){ sendp(incoming, strdup("[read error]")); break; }
+		if(n == 0){ sendp(incoming, strdup("[hangup]")); break; }
+		if(g_bcast && n >= 6){
+			uchar *s = (uchar*)buf;
+			snprint(out, sizeof out, "[%02x:%02x:%02x:%02x:%02x:%02x] %.*s",
+				s[0], s[1], s[2], s[3], s[4], s[5], (int)(n - 6), buf + 6);
+		}else
+			snprint(out, sizeof out, "%.*s", (int)n, buf);
+		sendp(incoming, strdup(out));
+	}
+}
+
+static void
+sendline(void)
+{
+	char echo[INPUTMAX + 8];
+
+	if(ninput == 0)
+		return;
+	input[ninput] = 0;
+	if(fswrite(dataW, input, ninput) < 0)
+		addline("[send failed]");
+	else{
+		snprint(echo, sizeof echo, "[me] %s", input);
+		addline(echo);
+	}
+	ninput = 0;
+	input[0] = 0;
+}
+
+static void
+key(Rune r)
+{
+	switch(r){
+	case '\n':
+	case '\r':
+		sendline();
+		break;
+	case Kbs:
+		if(ninput > 0)
+			ninput--;
+		break;
+	case Kesc:
+		ninput = 0;
+		break;
+	case Keof:            /* ^D: clean hangup + quit */
+		fsclose(ctl);
+		threadexitsall(nil);
+	default:
+		if(r >= 0x20 && r < 0x7f && ninput < INPUTMAX - 1)
+			input[ninput++] = r;   /* ASCII-only input for v1 */
+		break;
+	}
+	input[ninput] = 0;
+	redraw();
+}
+
+void
+threadmain(int argc, char **argv)
+{
+	char *port = "/dev/cu.usbmodem1203";
+	char *dst  = "ff:ff:ff:ff:ff:ff";
+	char nb[32], cmd[64], path[64], banner[128];
+	int fd, conv, ai = 1;
+	long n;
+	Mousectl *mc;
+	Keyboardctl *kc;
+	Rune r;
+	char *msg;
+
+	if(argc > ai){ port = argv[ai]; ai++; }
+	if(argc > ai){ dst  = argv[ai]; ai++; }
+
+	/* --- transport (identical to achat_core.c) --- */
+	fd = serial_open(port);
+	if(fd < 0)
+		sysfatal("open %s: %r", port);
+	sleep(400);
+	fs = fsmount(fd, nil);
+	if(fs == nil)
+		sysfatal("fsmount %s: %r", port);
+	ctl = fsopen(fs, "net/aether/clone", ORDWR);
+	if(ctl == nil)
+		sysfatal("open net/aether/clone: %r");
+	n = fsread(ctl, nb, sizeof nb - 1);
+	if(n <= 0)
+		sysfatal("read conv#: %r");
+	nb[n] = 0;
+	conv = atoi(nb);
+	g_bcast = (strcmp(dst, "ff:ff:ff:ff:ff:ff") == 0);
+	snprint(cmd, sizeof cmd, "connect %s", dst);
+	if(fswrite(ctl, cmd, strlen(cmd)) < 0)
+		sysfatal("connect %s: %r", dst);
+	snprint(path, sizeof path, "net/aether/%d/data", conv);
+	dataR = fsopen(fs, path, ORDWR);
+	dataW = fsopen(fs, path, ORDWR);
+	if(dataR == nil || dataW == nil)
+		sysfatal("open %s: %r", path);
+
+	/* --- UI --- */
+	if(initdraw(nil, nil, "achat") < 0)
+		sysfatal("initdraw: %r");
+	if((mc = initmouse(nil, screen)) == nil)
+		sysfatal("initmouse: %r");
+	if((kc = initkeyboard(nil)) == nil)
+		sysfatal("initkeyboard: %r");
+
+	back  = display->black;
+	txt   = display->white;
+	mecol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreen);
+	if(mecol == nil) mecol = txt;
+
+	incoming = chancreate(sizeof(char*), 32);
+	layout();
+	snprint(banner, sizeof banner, "[achat] conv %d on %s -- type + Enter; ^D quits", conv, dst);
+	addline(banner);
+	redraw();
+
+	proccreate(reader, nil, 16384);
+
+	enum { AKEY, ARESIZE, AMSG, AEND };
+	Alt alts[] = {
+		[AKEY]    = { kc->c,       &r,   CHANRCV },
+		[ARESIZE] = { mc->resizec, nil,  CHANRCV },
+		[AMSG]    = { incoming,    &msg, CHANRCV },
+		[AEND]    = { nil,         nil,  CHANEND },
+	};
+	for(;;){
+		switch(alt(alts)){
+		case AKEY:
+			key(r);
+			break;
+		case ARESIZE:
+			if(getwindow(display, Refnone) < 0)
+				sysfatal("resize: %r");
+			layout();
+			redraw();
+			break;
+		case AMSG:
+			addline(msg);
+			free(msg);
+			redraw();
+			break;
+		}
+	}
+}
