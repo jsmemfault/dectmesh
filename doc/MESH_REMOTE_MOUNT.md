@@ -1,5 +1,12 @@
 # Modem-side mesh remote-mount (`aether!<addr>` resolved at the relay)
 
+> **MOTHBALLED (2026-07-22).** Proven end-to-end via targeted `9p` (relay 0.38.21),
+> but shelved: the dumb-FUSE-client browse it targeted is dropped, and the capability
+> is redundant with the host `aether_conv --bridge` (same remote-fs-over-mesh, more
+> robust). Code + firmware remain, dormant. Focus moved to an `achat` rc client over
+> a real (non-FUSE) 9P mount of a node's own `/dev/aether`+`/net/aether`. Doc kept for
+> reference.
+
 **Who this is for.** A **dumb 9P client** — one that speaks stock 9P over the
 modem's L2CAP/USB but can NOT run a custom transport of its own. The main case is
 a **macOS host** browsing over `l2cat` + `9pfuse`/plan9port (the majority of this
