@@ -35,6 +35,29 @@ static int   ninput;
 static Rectangle transr, inputr;
 static Image *back, *txt, *mecol;
 static Channel *incoming;            /* char* formatted lines from the reader proc */
+static char nick[64];                /* /nick prefix on outgoing messages */
+
+/* Clunk the ctl fid so the 9151 frees the conversation -- idempotent, and the
+ * single choke point every exit path funnels through so the node never wedges. */
+static void
+hangup(void)
+{
+	if(ctl){
+		fsclose(ctl);
+		ctl = nil;
+	}
+}
+
+/* libdraw error handler: fires when devdraw dies (window closed via the red
+ * button), so the close button hangs up cleanly instead of wedging the node. */
+static void
+drawerr(Display *d, char *m)
+{
+	USED(d);
+	fprint(2, "achat: draw error: %s\n", m);
+	hangup();
+	threadexitsall(nil);
+}
 
 static void
 addline(char *s)
@@ -108,15 +131,66 @@ reader(void *a)
 	}
 }
 
+/* slash-commands typed in the input line. */
+static void
+docmd(char *s)
+{
+	char m[400];
+
+	if(strncmp(s, "/nick", 5) == 0 && (s[5] == ' ' || s[5] == 0)){
+		char *p = s + 5;
+		while(*p == ' ')
+			p++;
+		strncpy(nick, p, sizeof nick - 1);
+		nick[sizeof nick - 1] = 0;
+		snprint(m, sizeof m, "[achat] nick set to '%s'", nick);
+		addline(m);
+	}else if(strcmp(s, "/who") == 0){
+		/* the node's live neighbour table, read straight off dev/aether. */
+		CFid *f = fsopen(fs, "dev/aether/neighbors", OREAD);
+		char buf[2048], *p, *nl;
+		long n;
+		if(f == nil){ addline("[who] unavailable"); return; }
+		n = fsread(f, buf, sizeof buf - 1);
+		fsclose(f);
+		if(n <= 0){ addline("[who] no neighbours"); return; }
+		buf[n] = 0;
+		addline("[who] neighbours:");
+		for(p = buf; (nl = strchr(p, '\n')) != nil; p = nl + 1){
+			*nl = 0;
+			if(*p){ snprint(m, sizeof m, "  %s", p); addline(m); }
+		}
+		if(*p){ snprint(m, sizeof m, "  %s", p); addline(m); }
+	}else if(strcmp(s, "/quit") == 0){
+		hangup();
+		threadexitsall(nil);
+	}else if(strcmp(s, "/help") == 0){
+		addline("[achat] /nick NAME | /who | /quit  (or ^D)");
+	}else{
+		snprint(m, sizeof m, "[achat] unknown command: %s (try /help)", s);
+		addline(m);
+	}
+}
+
 static void
 sendline(void)
 {
-	char echo[INPUTMAX + 8];
+	char payload[INPUTMAX + 80], echo[INPUTMAX + 8];
 
 	if(ninput == 0)
 		return;
 	input[ninput] = 0;
-	if(fswrite(dataW, input, ninput) < 0)
+	if(input[0] == '/'){
+		docmd(input);
+		ninput = 0;
+		input[0] = 0;
+		return;
+	}
+	if(nick[0])
+		snprint(payload, sizeof payload, "%s: %s", nick, input);
+	else
+		snprint(payload, sizeof payload, "%s", input);
+	if(fswrite(dataW, payload, strlen(payload)) < 0)
 		addline("[send failed]");
 	else{
 		snprint(echo, sizeof echo, "[me] %s", input);
@@ -142,7 +216,7 @@ key(Rune r)
 		ninput = 0;
 		break;
 	case Keof:            /* ^D: clean hangup + quit */
-		fsclose(ctl);
+		hangup();
 		threadexitsall(nil);
 	default:
 		if(r >= 0x20 && r < 0x7f && ninput < INPUTMAX - 1)
@@ -173,7 +247,8 @@ threadmain(int argc, char **argv)
 	 * It MUST run before fsmount creates the lib9pclient mux's ioproc threads:
 	 * forking a process that already has those threads corrupts the mux, and the
 	 * reader's first fsread then fails immediately ([read error], one-sided chat). */
-	if(initdraw(nil, nil, "achat") < 0)
+	atexit(hangup);   /* free the conversation on ANY exit path */
+	if(initdraw(drawerr, nil, "achat") < 0)
 		sysfatal("initdraw: %r");
 	if((mc = initmouse(nil, screen)) == nil)
 		sysfatal("initmouse: %r");
@@ -214,7 +289,7 @@ threadmain(int argc, char **argv)
 	if(dataR == nil || dataW == nil)
 		sysfatal("open %s: %r", path);
 
-	snprint(banner, sizeof banner, "[achat] conv %d on %s -- type + Enter; ^D quits", conv, dst);
+	snprint(banner, sizeof banner, "[achat] conv %d on %s -- /help for commands, ^D quits", conv, dst);
 	addline(banner);
 	redraw();
 
