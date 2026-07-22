@@ -78,27 +78,70 @@ layout(void)
 	transr = Rect(r.min.x, r.min.y, r.max.x, inputr.min.y);
 }
 
+/* How many leading chars of s fit in pixel width w (>=1 to guarantee progress). */
+static int
+fitchars(char *s, int w)
+{
+	char tmp[LINEMAX];
+	int i;
+
+	for(i = 0; s[i] && i < LINEMAX - 1; i++){
+		tmp[i] = s[i];
+		tmp[i+1] = 0;
+		if(stringwidth(font, tmp) > w)
+			return i > 0 ? i : 1;
+	}
+	return i;
+}
+
+struct wrow { char *s; int n; Image *col; };
+
 static void
 redraw(void)
 {
-	int nfit, start, i;
-	Point p;
-	char pbuf[INPUTMAX + 4];
-	Point after;
+	static struct wrow rows[512];   /* main-proc-only; keep it off the thread stack */
+	int nfit, avail, nrows, start, i, firstline;
+	Point p, after;
+	char pbuf[INPUTMAX + 4], tmp[LINEMAX];
 
-	/* transcript: show the newest lines that fit, top-to-bottom */
 	draw(screen, transr, back, nil, ZP);
+	avail = Dx(transr) - 6;
+	if(avail < font->height) avail = font->height;
 	nfit = Dy(transr) / font->height;
-	start = nlines > nfit ? nlines - nfit : 0;
-	p = addpt(transr.min, Pt(3, 2));
-	for(i = start; i < nlines; i++){
+
+	/* wrap the last nfit logical lines into display rows (each >=1 row, so nfit
+	 * lines yield >= nfit rows -- enough to fill the transcript). */
+	nrows = 0;
+	firstline = nlines > nfit ? nlines - nfit : 0;
+	for(i = firstline; i < nlines && nrows < nelem(rows); i++){
 		char *ln = ring[i % MAXLINES];
-		Image *c = (strncmp(ln, "[me]", 4) == 0) ? mecol : txt;
-		string(screen, p, c, ZP, font, ln);
+		Image *col = (strncmp(ln, "[me]", 4) == 0) ? mecol : txt;
+		int off = 0, L = strlen(ln);
+		do {
+			int fit = fitchars(ln + off, avail);
+			if(off + fit > L) fit = L - off;
+			rows[nrows].s = ln + off;
+			rows[nrows].n = fit;
+			rows[nrows].col = col;
+			nrows++;
+			off += fit;
+		} while(off < L && nrows < nelem(rows));
+		if(L == 0){ rows[nrows-1].s = ln; rows[nrows-1].n = 0; }  /* keep blank lines */
+	}
+
+	/* draw the newest nfit rows, top-to-bottom */
+	start = nrows > nfit ? nrows - nfit : 0;
+	p = addpt(transr.min, Pt(3, 2));
+	for(i = start; i < nrows; i++){
+		int L = rows[i].n;
+		if(L > LINEMAX - 1) L = LINEMAX - 1;
+		memmove(tmp, rows[i].s, L);
+		tmp[L] = 0;
+		string(screen, p, rows[i].col, ZP, font, tmp);
 		p.y += font->height;
 	}
 
-	/* input line, with a separator + block cursor */
+	/* input line: separator + prompt + block cursor */
 	draw(screen, inputr, back, nil, ZP);
 	line(screen, Pt(inputr.min.x, inputr.min.y), Pt(inputr.max.x, inputr.min.y),
 		0, 0, 0, txt, ZP);
