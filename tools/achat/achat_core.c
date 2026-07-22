@@ -56,7 +56,7 @@ reader(void *a)
 			break;
 		}
 		if(n == 0)
-			continue;
+			break;   /* len-0 hangup sentinel: the conversation was freed */
 		show(buf, n);
 	}
 	threadexitsall(nil);
@@ -115,9 +115,10 @@ threadmain(int argc, char **argv)
 		for(;;){
 			n = fsread(dataR, line, sizeof line);
 			if(n < 0){ fprint(2, "[read error: %r]\n"); break; }
-			if(n == 0) continue;
+			if(n == 0) break;   /* hangup sentinel */
 			show(line, n);
 		}
+		fsclose(ctl);   /* free the conversation upstream */
 		threadexitsall(nil);
 	}
 
@@ -150,6 +151,13 @@ threadmain(int argc, char **argv)
 			print("[me] %.*s\n", (int)n, line);   /* local echo (server suppresses own broadcast) */
 	}
 
+	/* ^D / EOF -> clean hangup: clunk the ctl fid so the 9151 frees the
+	 * conversation (leaves NO stale conv state, which is what wedges the
+	 * inter-chip link on abrupt kills). The freed conversation makes the reader
+	 * proc's blocked fsread return the len-0 sentinel, so it unwinds and
+	 * threadexitsall then terminates cleanly. */
 	closeioproc(io);
+	print("[achat] hangup\n");
+	fsclose(ctl);
 	threadexitsall(nil);
 }
