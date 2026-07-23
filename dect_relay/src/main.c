@@ -609,6 +609,30 @@ static void mesh_remote_down(void *user)
 	k_mutex_unlock(&mesh_sess);
 }
 
+/*
+ * A host 9P session dropped (DTR de-asserted -- typically achat was killed).
+ * If it left a proxied /net/aether operation outstanding on mesh_client -- a
+ * blocking data read is the common case -- that request stays stuck and fouls
+ * the link, so the next session's re-version/attach times out (-116). That is
+ * the 30-60s "connecting..." hang (or outright failure) after a kill.
+ *
+ * Reset the client to abort the stuck request and release the link, then force
+ * a clean Tversion on the next proxied op: mesh_versioned=false makes
+ * mesh_ensure_attached re-version rather than re-Tattach, which also clears the
+ * 9151's whole fid table -- freeing any conversation the killed client leaked.
+ * Runs from the session pool BEFORE the dead session's fids are clunked.
+ */
+static void mesh_host_disconnected(void *ctx)
+{
+	ARG_UNUSED(ctx);
+	ninep_client_reset(&mesh_client);
+	k_mutex_lock(&mesh_sess, K_FOREVER);
+	mesh_attached = false;
+	mesh_versioned = false;
+	k_mutex_unlock(&mesh_sess);
+	LOG_INF("host session dropped: mesh_client reset, re-attach will re-version");
+}
+
 /* --- remote_fs hooks for the /net/mesh re-export (the NESTED layer) ---------
  * root_fn: ensure the OUTER 9151 link is up, open+connect a /net/aether
  * conversation to g_mesh_peer, then version+attach the nested client (which
@@ -1377,6 +1401,7 @@ static int fw_9p_init(void)
 		.rx_buf_size_per_session = CONFIG_NINEP_MAX_MESSAGE_SIZE,
 		.fs_ops = ninep_union_fs_get_ops(),
 		.fs_context = &fw_union,
+		.on_disconnect = mesh_host_disconnected,   /* release a stuck mesh_client on host kill */
 	};
 	err = ninep_session_pool_uart_init(&fw_uart_pool, &pool_cfg);
 	if (err) {
