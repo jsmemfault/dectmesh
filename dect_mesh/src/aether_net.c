@@ -259,6 +259,18 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 	if (len > AETHER_MAX_MSG) {
 		len = AETHER_MAX_MSG;
 	}
+	/* The app addresses peers by their durable identity (node_eui), never the
+	 * churning HONR route. A broadcast frame already carries node_eui as src;
+	 * a unicast frame carries the HONR src, so resolve it back to the stable
+	 * identity here. If the binding isn't known yet, fall back to the raw src
+	 * (announced convs still display it; a connected filter just won't match). */
+	const uint8_t *ident = src;
+	uint8_t ident_buf[6];
+
+	if (!broadcast &&
+	    aether_mesh_addr_to_eui(g_fs.iface, src, ident_buf) == 0) {
+		ident = ident_buf;
+	}
 	k_mutex_lock(&g_fs.lock, K_FOREVER);
 	g_fs.ctr.rx++;
 	g_fs.ctr.rx_bytes += (uint32_t)len;
@@ -269,17 +281,17 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 			continue;
 		}
 		/* §6a: broadcasts fan into every party-line conv; unicast goes to
-		 * announced (any peer) or a connected conv bound to this src. */
+		 * announced (any peer) or a connected conv bound to this durable id. */
 		bool take = broadcast
 			    ? (c->state == CONV_BCAST)
 			    : (c->state == CONV_ANNOUNCED ||
-			       (c->state == CONV_CONNECTED && memcmp(c->peer, src, 6) == 0));
+			       (c->state == CONV_CONNECTED && memcmp(c->peer, ident, 6) == 0));
 		if (!take) {
 			continue;
 		}
 		struct aether_dgram d;
 
-		memcpy(d.src, src, 6);
+		memcpy(d.src, ident, 6);
 		d.len = (uint16_t)len;
 		memcpy(d.data, payload, len);
 		if (k_msgq_put(&c->rxq, &d, K_NO_WAIT) != 0) {
@@ -568,6 +580,7 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 	if (an->kind == K_DATA) {
 		const uint8_t *dst, *payload;
 		uint32_t plen;
+		uint8_t route[6];   /* durable peer id -> current HONR route */
 
 		if (!c) {
 			return -ENOTCONN;
@@ -601,18 +614,33 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 			return (int)count;
 		}
 		if (c->state == CONV_CONNECTED) {
-			/* connected: bare payload -> the bound peer (spec §4). */
-			dst = c->peer;
+			/* connected: bare payload -> the bound peer (spec §4). c->peer is a
+			 * durable node_eui; resolve it to the peer's CURRENT HONR route. If
+			 * the binding isn't known (e.g. a non-neighbor addressed directly by
+			 * its HONR addr for multi-hop), fall through to the address as given
+			 * -- node_euis and HONR addrs don't collide, so this preserves the
+			 * legacy by-HONR path while making by-eui churn-robust. */
+			if (aether_mesh_eui_to_addr(g_fs.iface, c->peer, route) == 0) {
+				dst = route;
+			} else {
+				dst = c->peer;
+			}
 			payload = buf;
 			plen = count;
 		} else if (c->state == CONV_ANNOUNCED) {
 			/* announced: [dst][payload] -> reply to a requester (spec §4/§8),
 			 * symmetric with the source-prefixed announced read. This is what
-			 * lets a node be a 9P server/exporter over the mesh. */
+			 * lets a node be a 9P server/exporter over the mesh. The [dst] prefix
+			 * is a durable node_eui (matching the src an announced read reports);
+			 * resolve it to the current route, same passthrough fallback. */
 			if (count < 6) {
 				return -EINVAL;
 			}
-			dst = buf;
+			if (aether_mesh_eui_to_addr(g_fs.iface, buf, route) == 0) {
+				dst = route;
+			} else {
+				dst = buf;
+			}
 			payload = buf + 6;
 			plen = count - 6;
 		} else {
