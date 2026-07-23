@@ -26,6 +26,10 @@ static CFid  *dataR;  /* net/aether/<conv>/data -- reader fid */
 static CFid  *dataW;  /* net/aether/<conv>/data -- writer fid (SEPARATE fid so a
                        * blocked fsread and an fswrite don't serialize on one fid) */
 static int    g_bcast; /* broadcast conversation -> reads carry a 6-byte src prefix */
+static char   g_dst[24];      /* current target addr, for /connect re-targeting */
+static char   myaddrbuf[24];  /* this node's own HONR addr, as a connect string */
+static int    switching;      /* /connect in flight: reader re-targets ctl on EOF */
+static QLock  convlk;         /* guards g_dst/switching + ctl writes across procs */
 
 /* Format+print one received datagram. §6a broadcast (and announced) reads carry
  * a 6-byte raw source address prefix (see aether_conv.c do_brecv); connected
@@ -41,12 +45,40 @@ show(char *buf, long n)
 		print("%.*s\n", (int)n, buf);
 }
 
+/* This node's own HONR routing address as a connect string (00:00:00:00:XX:XX) --
+ * what a peer types into /connect to reach us reliably. Read from dev/aether/addr
+ * (the 9151's HONR short address, ~4 hex digits). */
+static void
+myaddr(char *out, int outsz)
+{
+	CFid *f;
+	char b[32], h[8];
+	long n;
+	int i, hi = 0;
+
+	strecpy(out, out + outsz, "?");
+	if((f = fsopen(fs, "dev/aether/addr", OREAD)) == nil)
+		return;
+	n = fsread(f, b, sizeof b - 1);
+	fsclose(f);
+	if(n <= 0)
+		return;
+	b[n] = 0;
+	for(i = 0; b[i] && hi < 4; i++)
+		if(strchr("0123456789abcdefABCDEF", b[i]))
+			h[hi++] = b[i];
+	while(hi < 4)
+		h[hi++] = '0';
+	snprint(out, outsz, "00:00:00:00:%c%c:%c%c", h[0], h[1], h[2], h[3]);
+}
+
 /* reader: one datagram per fsread. */
 static void
 reader(void *a)
 {
-	char buf[1024];
+	char buf[1024], cmd[64];
 	long n;
+	int w, bc;
 
 	USED(a);
 	for(;;){
@@ -55,11 +87,89 @@ reader(void *a)
 			fprint(2, "\n[read error: %r]\n");
 			break;
 		}
-		if(n == 0)
-			break;   /* len-0 hangup sentinel: the conversation was freed */
+		if(n == 0){
+			/* len-0 EOF sentinel. If a /connect is in flight, this is the
+			 * "hangup" we asked for -- re-target the same conversation (still
+			 * UNCONNECTED after the hangup) and keep reading the same fid, no
+			 * fid churn. Otherwise it's a stray/late EOF (e.g. a rapid double
+			 * /connect): re-read. Shutdown goes via ^D -> threadexitsall. */
+			qlock(&convlk);
+			if(!switching){
+				qunlock(&convlk);
+				continue;
+			}
+			snprint(cmd, sizeof cmd, "connect %s", g_dst);
+			w = fswrite(ctl, cmd, strlen(cmd));
+			bc = g_bcast;
+			switching = 0;
+			qunlock(&convlk);
+			if(w < 0){ print("[connect failed -- try /connect again]\n"); continue; }
+			if(bc)
+				print("[on the party line (broadcast, best-effort)]\n");
+			else
+				print("[connected (reliable) to %s -- peer must /connect you too]\n", g_dst);
+			continue;
+		}
 		show(buf, n);
 	}
 	threadexitsall(nil);
+}
+
+/* slash-commands typed on stdin. */
+static void
+docmd(char *s)
+{
+	if(strcmp(s, "/quit") == 0){
+		print("[achat] hangup\n");
+		fsclose(ctl);
+		threadexitsall(nil);
+	}else if(strcmp(s, "/addr") == 0){
+		print("[achat] my address: %s   (peer: /connect %s)\n", myaddrbuf, myaddrbuf);
+	}else if(strcmp(s, "/who") == 0){
+		CFid *f = fsopen(fs, "dev/aether/neighbors", OREAD);
+		char buf[2048];
+		long n;
+		if(f == nil){ print("[who] unavailable\n"); return; }
+		n = fsread(f, buf, sizeof buf - 1);
+		fsclose(f);
+		if(n <= 0){ print("[who] no neighbours\n"); return; }
+		buf[n] = 0;
+		print("[who] neighbours:\n%s\n", buf);
+	}else if(strncmp(s, "/connect", 8) == 0 && (s[8] == ' ' || s[8] == 0)){
+		char *p = s + 8, newdst[24];
+		while(*p == ' ')
+			p++;
+		if(*p == 0){
+			print("[achat] usage: /connect <addr>   (or /connect bcast for the party line)\n");
+			return;
+		}
+		if(strcmp(p, "bcast") == 0 || strcmp(p, "broadcast") == 0)
+			strcpy(newdst, "ff:ff:ff:ff:ff:ff");
+		else if(strlen(p) <= 5)
+			snprint(newdst, sizeof newdst, "00:00:00:00:%s", p);
+		else
+			snprint(newdst, sizeof newdst, "%s", p);
+		/* Re-target the same conversation in place via hangup+connect (see the
+		 * reader's EOF handling): resets to UNCONNECTED and wakes the reader,
+		 * which then issues the connect -- no fid churn, and prompt. */
+		qlock(&convlk);
+		strncpy(g_dst, newdst, sizeof g_dst - 1);
+		g_dst[sizeof g_dst - 1] = 0;
+		g_bcast = (strcmp(newdst, "ff:ff:ff:ff:ff:ff") == 0);
+		switching = 1;
+		if(fswrite(ctl, "hangup", 6) < 0){
+			switching = 0;
+			qunlock(&convlk);
+			print("[achat] /connect: hangup failed -- try again\n");
+			return;
+		}
+		qunlock(&convlk);
+		print("[achat] switching to %s ...\n", newdst);
+	}else if(strcmp(s, "/help") == 0){
+		print("[achat] /addr | /who | /connect <addr>|bcast | /quit  (or ^D)\n");
+	}else{
+		print("[achat] unknown command: %s (try /help)\n", s);
+	}
 }
 
 void
@@ -99,6 +209,8 @@ threadmain(int argc, char **argv)
 
 	/* join the party line (or dial a peer): write to the ctl fid. */
 	g_bcast = (strcmp(dst, "ff:ff:ff:ff:ff:ff") == 0);
+	strncpy(g_dst, dst, sizeof g_dst - 1);   /* for /connect re-targeting */
+	g_dst[sizeof g_dst - 1] = 0;
 	snprint(cmd, sizeof cmd, "connect %s", dst);
 	if(fswrite(ctl, cmd, strlen(cmd)) < 0)
 		sysfatal("connect %s: %r", dst);
@@ -108,7 +220,8 @@ threadmain(int argc, char **argv)
 	if(dataR == nil)
 		sysfatal("open %s (read): %r", path);
 
-	print("[achat] conv %d connected to %s -- type to send, ^D to quit\n", conv, dst);
+	print("[achat] conv %d -- %s -- to %s\n", conv,
+		g_bcast ? "party line (broadcast, best-effort)" : "connected (reliable)", dst);
 
 	if(rxonly){
 		/* single-threaded receive loop, no writer, no second thread */
@@ -128,6 +241,10 @@ threadmain(int argc, char **argv)
 	if(dataW == nil)
 		sysfatal("open %s (write): %r", path);
 
+	myaddr(myaddrbuf, sizeof myaddrbuf);
+	print("[achat] my address: %s   (peer: /connect %s for reliable 1:1)\n", myaddrbuf, myaddrbuf);
+	print("[achat] /help for commands, ^D to quit\n");
+
 	/* reader in its OWN proc (real OS thread), not a cooperative thread: its
 	 * blocking fsread must not be gated by the main proc's stdin wait, and the
 	 * lib9pclient mux is proc-safe (QLock-guarded) so concurrent fsread/fswrite
@@ -145,6 +262,11 @@ threadmain(int argc, char **argv)
 			n--;
 		if(n == 0)
 			continue;
+		line[n] = 0;
+		if(line[0] == '/'){   /* slash-command, not a message */
+			docmd(line);
+			continue;
+		}
 		if(fswrite(dataW, line, n) < 0)
 			fprint(2, "[send failed: %r]\n");
 		else
