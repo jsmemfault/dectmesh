@@ -226,16 +226,25 @@ reader(void *a)
 	long n;
 
 	int fails = 0;
+	vlong t0;
 
 	USED(a);
 	for(;;){
+		t0 = nsec();
 		n = fsread(dataR, buf, sizeof buf);
 		if(n < 0){
-			/* The conversation was wiped mid-session (relay re-Tattach under load).
-			 * Fully re-clone it (fixes both dataR and dataW) and keep going -- don't
-			 * give up, so the chat self-heals. Report only the first hiccup and each
-			 * successful recovery. */
 			int r;
+			vlong dt = (nsec() - t0) / 1000000;   /* ms blocked before failing */
+
+			/* A /net/aether/data read legitimately BLOCKS until the next broadcast.
+			 * The relay caps that block (~timeout) and returns an error -- but on a
+			 * quiet party line that's NOT a real failure, just "no message yet". So
+			 * if we blocked a long time before failing, silently re-read (no spam,
+			 * no re-clone). A FAST failure means the conversation was actually wiped
+			 * (relay re-Tattach under load clunked our fids) -> re-clone to recover. */
+			if(dt > 8000)
+				continue;
+
 			if(fails++ == 0){
 				snprint(out, sizeof out, "[rx hiccup: %r -- reconnecting]");
 				sendp(incoming, strdup(out));
