@@ -55,7 +55,9 @@ LOG_MODULE_REGISTER(aether_net, LOG_LEVEL_INF);
  * 4 and dropped ("conv N rxq full, dropping datagram"), degrading delivery. 16
  * absorbs realistic bursts while the client catches up in the mesh-idle gaps. */
 #define AETHER_RXQ_DEPTH   16
-#define AETHER_NET_RETRIES 3     /* reliable-send retry budget (DECT PHY also helps) */
+#define AETHER_NET_RETRIES 5     /* reliable-send retry budget; with the ACK-timeout
+				  * backoff (aether_route.c) this rides out two-way
+				  * contention instead of failing at 3 lock-step retries */
 
 /* One received datagram queued for a conversation's data reader. */
 struct aether_dgram {
