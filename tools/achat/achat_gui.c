@@ -232,7 +232,7 @@ myaddr(char *out, int outsz)
 	int i;
 
 	strecpy(out, out + outsz, "?");
-	if((f = fsopen(fs, "dev/aether/addr", OREAD)) == nil)
+	if((f = fsopen(fs, "net/aether/addr", OREAD)) == nil)
 		return;
 	n = fsread(f, out, outsz - 1);
 	fsclose(f);
