@@ -74,11 +74,21 @@ reader(void *a)
 	char buf[1024], cmd[64];
 	long n;
 	int w, bc;
+	vlong t0;
 
 	USED(a);
 	for(;;){
+		t0 = nsec();
 		n = fsread(dataR, buf, sizeof buf);
 		if(n < 0){
+			/* A connected/broadcast data read legitimately BLOCKS until the next
+			 * datagram; the relay caps that block (~20s) and returns an error. On
+			 * a quiet line that's NOT a failure -- if we blocked a long time,
+			 * silently re-read. A FAST error is a real problem. (Mirrors achat-gui.) */
+			vlong dt = (nsec() - t0) / 1000000;
+
+			if(dt > 8000)
+				continue;
 			fprint(2, "\n[read error: %r]\n");
 			break;
 		}

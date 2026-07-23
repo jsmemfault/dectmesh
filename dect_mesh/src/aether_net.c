@@ -281,11 +281,29 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 			continue;
 		}
 		/* §6a: broadcasts fan into every party-line conv; unicast goes to
-		 * announced (any peer) or a connected conv bound to this durable id. */
-		bool take = broadcast
-			    ? (c->state == CONV_BCAST)
-			    : (c->state == CONV_ANNOUNCED ||
-			       (c->state == CONV_CONNECTED && memcmp(c->peer, ident, 6) == 0));
+		 * announced (any peer) or a connected conv bound to this peer. */
+		bool take;
+
+		if (broadcast) {
+			take = (c->state == CONV_BCAST);
+		} else if (c->state == CONV_ANNOUNCED) {
+			take = true;   /* accepts any unicast source */
+		} else if (c->state == CONV_CONNECTED) {
+			/* Match by resolving the CONNECTED peer's durable id to its
+			 * current HONR route and comparing to the raw src -- the same
+			 * eui->addr lookup the TX path uses, so RX matching is exactly as
+			 * reliable as our ability to SEND to this peer (never fails when TX
+			 * works). The direct-compare fallback covers a legacy by-HONR
+			 * connect (c->peer already a route) and the resolved-eui case. */
+			uint8_t route[6];
+
+			take = (aether_mesh_eui_to_addr(g_fs.iface, c->peer, route) == 0 &&
+				memcmp(route, src, 6) == 0) ||
+			       memcmp(c->peer, ident, 6) == 0 ||
+			       memcmp(c->peer, src, 6) == 0;
+		} else {
+			take = false;
+		}
 		if (!take) {
 			continue;
 		}
