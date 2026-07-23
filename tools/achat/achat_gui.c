@@ -220,31 +220,26 @@ redraw(void)
 	flushimage(display, 1);
 }
 
-/* This node's own HONR routing address, formatted as a connect string
- * (00:00:00:00:XX:XX) -- what a peer types into /connect to reach us reliably.
- * Read from dev/aether/addr (the 9151's HONR short address, ~4 hex digits). */
+/* This node's own durable identity (node_eui / CGA), verbatim from
+ * dev/aether/addr -- the stable "aa:bb:cc:dd:ee:ff" a peer types into /connect.
+ * The app addresses purely by this durable id; the mesh resolves it to the
+ * (churning) HONR routing address internally. */
 static void
 myaddr(char *out, int outsz)
 {
 	CFid *f;
-	char b[32], h[8];
 	long n;
-	int i, hi = 0;
+	int i;
 
 	strecpy(out, out + outsz, "?");
 	if((f = fsopen(fs, "dev/aether/addr", OREAD)) == nil)
 		return;
-	n = fsread(f, b, sizeof b - 1);
+	n = fsread(f, out, outsz - 1);
 	fsclose(f);
-	if(n <= 0)
-		return;
-	b[n] = 0;
-	for(i = 0; b[i] && hi < 4; i++)
-		if(strchr("0123456789abcdefABCDEF", b[i]))
-			h[hi++] = b[i];
-	while(hi < 4)              /* left-pad short addrs to 4 hex digits */
-		h[hi++] = '0';
-	snprint(out, outsz, "00:00:00:00:%c%c:%c%c", h[0], h[1], h[2], h[3]);
+	if(n <= 0){ strecpy(out, out + outsz, "?"); return; }
+	out[n] = 0;
+	for(i = (int)n - 1; i >= 0 && (out[i] == '\n' || out[i] == '\r' || out[i] == ' '); i--)
+		out[i] = 0;   /* trim trailing newline/space */
 }
 
 /* reader proc: one datagram per fsread -> format -> hand to the UI proc. */
