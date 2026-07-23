@@ -34,11 +34,15 @@ static char *ring[MAXLINES];
 static int   nlines;                 /* monotonic total; line k lives at ring[k%MAXLINES] */
 static char  input[INPUTMAX];
 static int   ninput;
-static Rectangle transr, inputr;
-static Image *back, *txt, *mecol;
+static Rectangle transr, inputr, diagr;
+static Image *back, *txt, *mecol, *diagcol;
 static Channel *incoming;            /* char* formatted lines from the reader proc */
 static Channel *quitc;               /* note handler -> clean shutdown */
 static Channel *tickc;               /* watchdog heartbeat -> detect a dead devdraw */
+static Channel *diagc;               /* diag proc -> redraw when the mesh readout refreshes */
+static int   diagon = 1;             /* diagnostic panel visible (/diag toggles) */
+static char  diagbuf[4096];          /* formatted mesh-state readout (newline-separated) */
+static QLock diaglk;                 /* guards diagbuf: diag proc writes, redraw reads */
 static char nick[64];                /* /nick prefix on outgoing messages */
 static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
 static char g_dst[24];               /* target addr, for re-connecting the conversation */
@@ -143,7 +147,16 @@ layout(void)
 	Rectangle r = screen->r;
 	int ih = font->height + 6;
 	inputr = Rect(r.min.x, r.max.y - ih, r.max.x, r.max.y);
-	transr = Rect(r.min.x, r.min.y, r.max.x, inputr.min.y);
+	if(diagon){
+		int dw = Dx(r) * 2 / 5;   /* diag panel = right 40% */
+		if(dw < 260) dw = 260;
+		if(dw > Dx(r) - 200) dw = Dx(r) - 200;   /* leave room for chat */
+		diagr = Rect(r.max.x - dw, r.min.y, r.max.x, inputr.min.y);
+		transr = Rect(r.min.x, r.min.y, diagr.min.x, inputr.min.y);
+	} else {
+		diagr = Rect(0, 0, 0, 0);
+		transr = Rect(r.min.x, r.min.y, r.max.x, inputr.min.y);
+	}
 }
 
 /* How many leading chars of s fit in pixel width w (>=1 to guarantee progress). */
@@ -217,6 +230,35 @@ redraw(void)
 	after = string(screen, addpt(inputr.min, Pt(3, 3)), txt, ZP, font, pbuf);
 	draw(screen, Rect(after.x, after.y, after.x + 2, after.y + font->height), txt, nil, ZP);
 
+	/* diagnostic panel: separator + the mesh-state readout, one source line per
+	 * display row (truncated to fit; no wrap -- keeps the table columns aligned). */
+	if(diagon && Dx(diagr) > 0){
+		char dline[512];
+		char *s, *nl;
+		int avail = Dx(diagr) - 6;
+
+		draw(screen, diagr, back, nil, ZP);
+		line(screen, Pt(diagr.min.x, diagr.min.y), Pt(diagr.min.x, diagr.max.y),
+			0, 0, 0, txt, ZP);
+		p = addpt(diagr.min, Pt(4, 2));
+		qlock(&diaglk);
+		for(s = diagbuf; *s && p.y + font->height <= diagr.max.y; s = nl){
+			int L;
+
+			nl = strchr(s, '\n');
+			L = nl ? (int)(nl - s) : (int)strlen(s);
+			if(nl) nl++; else nl = s + L;
+			if(L > (int)sizeof dline - 1) L = sizeof dline - 1;
+			memmove(dline, s, L);
+			dline[L] = 0;
+			while(L > 0 && stringwidth(font, dline) > avail)
+				dline[--L] = 0;   /* truncate to width */
+			string(screen, p, diagcol, ZP, font, dline);
+			p.y += font->height;
+		}
+		qunlock(&diaglk);
+	}
+
 	flushimage(display, 1);
 }
 
@@ -240,6 +282,76 @@ myaddr(char *out, int outsz)
 	out[n] = 0;
 	for(i = (int)n - 1; i >= 0 && (out[i] == '\n' || out[i] == '\r' || out[i] == ' '); i--)
 		out[i] = 0;   /* trim trailing newline/space */
+}
+
+/* Read a whole small 9P file into buf (trimmed). Own fid, so it runs concurrently
+ * with the blocked chat read / writes via the lib9pclient tag mux. */
+static int
+readfile(char *path, char *buf, int sz)
+{
+	CFid *f;
+	long n;
+
+	f = fsopen(fs, path, OREAD);
+	if(f == nil){ snprint(buf, sz, "(n/a)"); return -1; }
+	n = fsread(f, buf, sz - 1);
+	fsclose(f);
+	if(n < 0) n = 0;
+	buf[n] = 0;
+	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' '))
+		buf[--n] = 0;
+	return n;
+}
+
+/* Reformat a space-separated table one-liner into one entry per line: a new line
+ * begins at each token immediately followed by `mark` ("identity" for neighbors,
+ * "via" for routes) so the columns stay readable in the narrow panel. */
+static void
+tabulate(char *dst, int dsz, char *src, char *mark)
+{
+	char work[1400], *toks[192];
+	int nt = 0, o = 0, i;
+	char *t;
+
+	strncpy(work, src, sizeof work - 1);
+	work[sizeof work - 1] = 0;
+	for(t = strtok(work, " "); t != nil && nt < 192; t = strtok(nil, " "))
+		toks[nt++] = t;
+	for(i = 0; i < nt && o < dsz - 1; i++){
+		int startline = (i + 1 < nt && strcmp(toks[i + 1], mark) == 0);
+		char *sep = (o == 0) ? "" : (startline ? "\n" : " ");
+		o += snprint(dst + o, dsz - o, "%s%s", sep, toks[i]);
+	}
+	dst[o < dsz ? o : dsz - 1] = 0;
+}
+
+/* diagnostic proc: periodically snapshot the mesh state from /net/aether and
+ * /dev/aether into diagbuf, then wake the UI to redraw the panel. */
+static void
+diagproc(void *a)
+{
+	char eui[64], honr[64], stats[160], nbrs[1200], routes[600];
+	char nbrt[1600], rtt[800];
+
+	USED(a);
+	for(;;){
+		if(!diagon){ sleep(1000); continue; }
+		readfile("net/aether/addr", eui, sizeof eui);
+		readfile("dev/aether/addr", honr, sizeof honr);
+		readfile("net/aether/stats", stats, sizeof stats);
+		readfile("dev/aether/neighbors", nbrs, sizeof nbrs);
+		readfile("dev/aether/routes", routes, sizeof routes);
+		tabulate(nbrt, sizeof nbrt, nbrs, "identity");
+		tabulate(rtt, sizeof rtt, routes, "via");
+		qlock(&diaglk);
+		snprint(diagbuf, sizeof diagbuf,
+			"== mesh diag ==\neui  %s\nhonr %s%s\nconn %s\n%s\n-- neighbors --\n%s\n-- routes --\n%s",
+			eui, honr, (strcmp(honr, "0000") == 0) ? "  <ROOT>" : "",
+			g_dst, stats, nbrt, rtt);
+		qunlock(&diaglk);
+		nbsendp(diagc, (void*)1);   /* non-blocking: wake redraw, never stall */
+		sleep(2500);
+	}
 }
 
 /* reader proc: one datagram per fsread -> format -> hand to the UI proc. */
@@ -395,12 +507,17 @@ docmd(char *s)
 		qunlock(&convlk);
 		snprint(m, sizeof m, "[achat] switching to %s ...", newdst);
 		addline(m);
+	}else if(strcmp(s, "/diag") == 0){
+		diagon = !diagon;
+		layout();
+		redraw();
 	}else if(strcmp(s, "/quit") == 0){
 		hangup();
 		threadexitsall(nil);
 	}else if(strcmp(s, "/help") == 0){
-		addline("[achat] /nick NAME | /who | /addr | /connect <addr>|bcast | /quit  (or ^D)");
+		addline("[achat] /nick NAME | /who | /addr | /connect <addr>|bcast | /diag | /quit  (or ^D)");
 		addline("[achat]   /connect <peer-addr> = reliable 1:1 (both sides connect); bcast = party line");
+		addline("[achat]   /diag = toggle the live mesh-state panel (neighbors / routes / stats)");
 	}else{
 		snprint(m, sizeof m, "[achat] unknown command: %s (try /help)", s);
 		addline(m);
@@ -501,9 +618,12 @@ threadmain(int argc, char **argv)
 	txt   = display->white;
 	mecol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreen);
 	if(mecol == nil) mecol = txt;
+	diagcol = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x88CCFFFF);  /* pale blue */
+	if(diagcol == nil) diagcol = txt;
 	incoming = chancreate(sizeof(char*), 32);
 	quitc = chancreate(sizeof(ulong), 2);
 	tickc = chancreate(sizeof(ulong), 2);
+	diagc = chancreate(sizeof(void*), 2);
 	threadnotify(noteh, 1);   /* catch ctrl-C etc. -> clean hangup */
 	layout();
 	addline("[achat] connecting...");
@@ -547,14 +667,17 @@ threadmain(int argc, char **argv)
 
 	proccreate(reader, nil, 16384);
 	proccreate(watchdog, nil, 4096);
+	proccreate(diagproc, nil, 16384);   /* periodic mesh-state readout for the panel */
 
-	enum { AKEY, ARESIZE, AMSG, AQUIT, ATICK, AEND };
+	enum { AKEY, ARESIZE, AMSG, AQUIT, ATICK, ADIAG, AEND };
+	void *dp;
 	Alt alts[] = {
 		[AKEY]    = { kc->c,       &r,   CHANRCV },
 		[ARESIZE] = { mc->resizec, nil,  CHANRCV },
 		[AMSG]    = { incoming,    &msg, CHANRCV },
 		[AQUIT]   = { quitc,       &qv,  CHANRCV },
 		[ATICK]   = { tickc,       &qv,  CHANRCV },
+		[ADIAG]   = { diagc,       &dp,  CHANRCV },
 		[AEND]    = { nil,         nil,  CHANEND },
 	};
 	for(;;){
@@ -583,6 +706,10 @@ threadmain(int argc, char **argv)
 				hangup();
 				threadexitsall(nil);
 			}
+			break;
+		case ADIAG:            /* mesh readout refreshed -> repaint the panel */
+			USED(dp);
+			redraw();
 			break;
 		}
 	}
