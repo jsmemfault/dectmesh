@@ -33,7 +33,13 @@ serial_open(const char *path)
 		return -1;
 	}
 	cfmakeraw(&t);
-	t.c_cflag |= CLOCAL | CREAD;
+	/* HUPCL: the kernel lowers DTR when the fd is closed -- including on an
+	 * abrupt process death (SIGKILL, crash), where no cleanup code runs. The
+	 * relay's 9P session pool is DTR-gated and polls DTR; the drop is what makes
+	 * it free the dead session (clunk fids, reset). Without HUPCL a killed achat
+	 * leaves DTR asserted, so the relay never sees the disconnect and the next
+	 * connection wedges on the stale session. */
+	t.c_cflag |= CLOCAL | CREAD | HUPCL;
 	t.c_cflag &= ~CRTSCTS;          /* no hardware flow control */
 	t.c_cc[VMIN] = 1;               /* block until at least 1 byte */
 	t.c_cc[VTIME] = 0;
