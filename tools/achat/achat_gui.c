@@ -42,8 +42,10 @@ static Channel *tickc;               /* watchdog heartbeat -> detect a dead devd
 static char nick[64];                /* /nick prefix on outgoing messages */
 static char datapath[64];            /* net/aether/<conv>/data, for reader reconnect */
 static char g_dst[24];               /* target addr, for re-connecting the conversation */
+static char myaddrbuf[24];           /* this node's own HONR addr, as a connect string */
 static int  conv;                    /* current conversation number */
 static QLock convlk;                 /* guards the conversation fids: reconv vs send */
+static int  switching;               /* /connect in flight: reader re-targets ctl on EOF */
 
 /* Re-establish the conversation on the existing mount: the relay wipes held
  * conversations when its 9151 link re-Tattaches destructively under load (a
@@ -218,6 +220,33 @@ redraw(void)
 	flushimage(display, 1);
 }
 
+/* This node's own HONR routing address, formatted as a connect string
+ * (00:00:00:00:XX:XX) -- what a peer types into /connect to reach us reliably.
+ * Read from dev/aether/addr (the 9151's HONR short address, ~4 hex digits). */
+static void
+myaddr(char *out, int outsz)
+{
+	CFid *f;
+	char b[32], h[8];
+	long n;
+	int i, hi = 0;
+
+	strecpy(out, out + outsz, "?");
+	if((f = fsopen(fs, "dev/aether/addr", OREAD)) == nil)
+		return;
+	n = fsread(f, b, sizeof b - 1);
+	fsclose(f);
+	if(n <= 0)
+		return;
+	b[n] = 0;
+	for(i = 0; b[i] && hi < 4; i++)
+		if(strchr("0123456789abcdefABCDEF", b[i]))
+			h[hi++] = b[i];
+	while(hi < 4)              /* left-pad short addrs to 4 hex digits */
+		h[hi++] = '0';
+	snprint(out, outsz, "00:00:00:00:%c%c:%c%c", h[0], h[1], h[2], h[3]);
+}
+
 /* reader proc: one datagram per fsread -> format -> hand to the UI proc. */
 static void
 reader(void *a)
@@ -260,7 +289,39 @@ reader(void *a)
 			continue;
 		}
 		fails = 0;
-		if(n == 0){ sendp(incoming, strdup("[hangup]")); break; }
+		if(n == 0){
+			/* EOF sentinel. If a /connect is in flight, this is the "hangup"
+			 * we asked for -- re-target the same conversation (still UNCONNECTED
+			 * after the hangup) and keep reading. Otherwise it's a real hangup. */
+			int w, bc;
+			char cmd[64];
+
+			qlock(&convlk);
+			if(!switching){
+				/* No /connect in flight: this is a stray/late EOF (e.g. a rapid
+				 * double /connect queued a second one). Nothing else produces a
+				 * len-0 datagram, so just re-read -- shutdown goes via ^D /
+				 * window-close (threadexitsall), never via a data EOF. */
+				qunlock(&convlk);
+				continue;
+			}
+			snprint(cmd, sizeof cmd, "connect %s", g_dst);
+			w = fswrite(ctl, cmd, strlen(cmd));
+			bc = g_bcast;
+			switching = 0;
+			qunlock(&convlk);
+			if(w < 0){
+				sendp(incoming, strdup("[connect failed -- try /connect again]"));
+				continue;
+			}
+			if(bc)
+				sendp(incoming, strdup("[on the party line (broadcast, best-effort)]"));
+			else{
+				snprint(out, sizeof out, "[connected (reliable) to %s -- peer must /connect you too]", g_dst);
+				sendp(incoming, strdup(out));
+			}
+			continue;
+		}
 		if(g_bcast && n >= 6){
 			uchar *s = (uchar*)buf;
 			snprint(out, sizeof out, "[%02x:%02x:%02x:%02x:%02x:%02x] %.*s",
@@ -301,11 +362,50 @@ docmd(char *s)
 			if(*p){ snprint(m, sizeof m, "  %s", p); addline(m); }
 		}
 		if(*p){ snprint(m, sizeof m, "  %s", p); addline(m); }
+	}else if(strcmp(s, "/addr") == 0){
+		snprint(m, sizeof m, "[achat] my address: %s   (peer: /connect %s)", myaddrbuf, myaddrbuf);
+		addline(m);
+	}else if(strncmp(s, "/connect", 8) == 0 && (s[8] == ' ' || s[8] == 0)){
+		char *p = s + 8, newdst[24];
+		while(*p == ' ')
+			p++;
+		if(*p == 0){
+			addline("[achat] usage: /connect <addr>   (or /connect bcast for the party line)");
+			return;
+		}
+		/* bcast keyword -> broadcast; short "HH:LL" -> full 00:00:00:00:HH:LL;
+		 * anything longer is taken as a full 6-group address. */
+		if(strcmp(p, "bcast") == 0 || strcmp(p, "broadcast") == 0)
+			strcpy(newdst, "ff:ff:ff:ff:ff:ff");
+		else if(strlen(p) <= 5)
+			snprint(newdst, sizeof newdst, "00:00:00:00:%s", p);
+		else
+			snprint(newdst, sizeof newdst, "%s", p);
+		/* Re-target the SAME conversation in place: "hangup" resets it to
+		 * UNCONNECTED (the server only accepts "connect" from there) AND wakes
+		 * the reader's blocked data read with an EOF sentinel. The reader then
+		 * issues "connect <newdst>" and keeps reading the same data fid -- no
+		 * fid churn (so no use-after-free vs the blocked reader), and prompt. */
+		qlock(&convlk);
+		strncpy(g_dst, newdst, sizeof g_dst - 1);
+		g_dst[sizeof g_dst - 1] = 0;
+		g_bcast = (strcmp(newdst, "ff:ff:ff:ff:ff:ff") == 0);
+		switching = 1;
+		if(fswrite(ctl, "hangup", 6) < 0){
+			switching = 0;
+			qunlock(&convlk);
+			addline("[achat] /connect: hangup failed -- try again");
+			return;
+		}
+		qunlock(&convlk);
+		snprint(m, sizeof m, "[achat] switching to %s ...", newdst);
+		addline(m);
 	}else if(strcmp(s, "/quit") == 0){
 		hangup();
 		threadexitsall(nil);
 	}else if(strcmp(s, "/help") == 0){
-		addline("[achat] /nick NAME | /who | /quit  (or ^D)");
+		addline("[achat] /nick NAME | /who | /addr | /connect <addr>|bcast | /quit  (or ^D)");
+		addline("[achat]   /connect <peer-addr> = reliable 1:1 (both sides connect); bcast = party line");
 	}else{
 		snprint(m, sizeof m, "[achat] unknown command: %s (try /help)", s);
 		addline(m);
@@ -441,7 +541,12 @@ threadmain(int argc, char **argv)
 	if(dataR == nil || dataW == nil)
 		sysfatal("open %s: %r", datapath);
 
-	snprint(banner, sizeof banner, "[achat] %s conv %d, party %s -- /help, ^D quits", port, conv, dst);
+	myaddr(myaddrbuf, sizeof myaddrbuf);
+	snprint(banner, sizeof banner, "[achat] %s conv %d -- %s -- /help, ^D quits", port, conv,
+		g_bcast ? "party line (broadcast, best-effort)" : "connected (reliable)");
+	addline(banner);
+	snprint(banner, sizeof banner, "[achat] my address: %s   (peer: /connect %s for reliable 1:1)",
+		myaddrbuf, myaddrbuf);
 	addline(banner);
 	redraw();
 
