@@ -29,6 +29,7 @@ top-level `README.md` for the bridge pattern). C tools are single-file; build wi
 | Tool | What it does |
 |------|--------------|
 | `mflt_forward.sh` | Drains **both chips'** Memfault chunks from the relay's composed 9P namespace (`dev/mflt5340` + the proxied `dev/mflt9151`) over one connection and POSTs them to Memfault. Each stream is self-describing (`DEV:<serial>:`), so one loop handles both. The bench stand-in for a field LTE gateway. `MEMFAULT_PROJECT_KEY=<key> mflt_forward.sh <relay 9P port> [interval]`. See `doc/OBSERVABILITY.md`. |
+| `mflt_upload_symbols.sh` | Uploads a `zephyr.elf` to Memfault (3-step presigned-upload REST flow, curl) so coredumps/traces symbolicate. Run once per software type+version. Needs an **Org Auth Token** via `MEMFAULT_ORG_TOKEN` (pass at runtime, never commit). `MEMFAULT_ORG_TOKEN=<oat> mflt_upload_symbols.sh <org> <project> <sw-type> <version> <elf>`. |
 
 ## Native chat client — `achat/`
 
