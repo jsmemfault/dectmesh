@@ -30,3 +30,14 @@ MEMFAULT_METRICS_KEY_DEFINE(dect_rx_err, kMemfaultMetricType_Unsigned)
 /* RF regime (build config) — group/filter the fleet by band, carrier, power. */
 MEMFAULT_METRICS_KEY_DEFINE(dect_carrier, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_tx_power, kMemfaultMetricType_Unsigned)
+
+/* Phase 2: self-organization + reliable-transport health (aephyr counters) and
+ * the datagram service (dect_mesh counters). These make the dashboard tell the
+ * mesh's story: self-heal rate, tree churn, ARQ reliability, back-pressure. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_reelections, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_orphans, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_arq_retx, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_arq_failed, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_data_tx, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_data_rx, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rxq_drops, kMemfaultMetricType_Unsigned)

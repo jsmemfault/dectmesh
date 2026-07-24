@@ -169,8 +169,15 @@ refreshed from real devices — exactly the "log in and see it" experience.
 - **To go live (needs your input):** set `CONFIG_MEMFAULT_NCS_PROJECT_KEY` (or pass the key
   to the forwarder), OTA the 0.7.39 image, and run `MEMFAULT_PROJECT_KEY=… mflt_forward.sh
   <9P port>` → **real data in Memfault.** Then build the dashboard above.
-- **Phase 2 (next):** the `new` counters (reelections, ARQ retx/failed, rxq drops, LBT,
-  airtime) in aephyr + the driver, and the discrete trace events.
+- **Phase 2 — DONE (dect_mesh 0.7.41):** aephyr counters `reelections`, `orphans`,
+  `arq_retx`, `arq_failed` (in the HONR election/orphan + ARQ send paths), plus the
+  datagram counters `data_tx`/`data_rx`/`rxq_drops` harvested from dect_mesh's own
+  `aether_net`. And **trace events** — `Dect_Reelection`, `Dect_Orphan`, `Dect_ArqFailed`
+  — emitted from `dect_metrics.c` when a counter steps (aephyr stays Memfault-free; the
+  app translates counter deltas into timeline events).
+- **Phase 2b (still to do):** the driver-level RF counters (`lbt_busy`, `tx_airtime_ms`,
+  `tx_ok`) need hooks in the DECT PHY driver; and 9P/inter-chip counters (`9p_requests`,
+  `link_resyncs`, `link_wedges`) in 9p4z.
 
 ## References
 `../dect_mesh/src/dect_metrics.c`, `../dect_mesh/config/memfault_metrics_heartbeat_config.def`,

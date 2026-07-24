@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2026 Jon Sharp
+ * SPDX-License-Identifier: MIT
+ *
+ * User-defined Memfault trace-event reasons for the Aether/HONR mesh -- the
+ * discrete, timestamped moments in a node's life (vs the periodic heartbeat
+ * metrics). Emitted from dect_metrics.c when the aephyr counters step.
+ */
+
+/* Self-organization: the network re-formed a root here (self-heal), or this node
+ * lost the tree above it (topology churn). Scrub the timeline to see the mesh heal. */
+MEMFAULT_TRACE_REASON_DEFINE(Dect_Reelection)
+MEMFAULT_TRACE_REASON_DEFINE(Dect_Orphan)
+
+/* Reliable transport: a datagram gave up after all ARQ retries -- a real delivery
+ * failure worth a discrete event, not just a counter tick. */
+MEMFAULT_TRACE_REASON_DEFINE(Dect_ArqFailed)

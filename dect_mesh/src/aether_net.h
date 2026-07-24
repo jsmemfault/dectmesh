@@ -18,4 +18,8 @@ int aether_net_init(struct net_if *iface, const uint8_t myaddr[6]);
 const struct ninep_fs_ops *aether_net_get_ops(void);
 void *aether_net_get_ctx(void);
 
+/* Datagram-service counters for fleet telemetry: whole datagrams sent/received
+ * and conversation-rxq-full drops (the back-pressure signal). Any pointer NULL. */
+void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops);
+
 #endif /* AETHER_NET_H_ */

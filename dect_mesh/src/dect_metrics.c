@@ -9,6 +9,7 @@
  */
 
 #include "dect_metrics.h"
+#include "aether_net.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -20,6 +21,7 @@
 
 #if defined(CONFIG_MEMFAULT)
 #include <memfault/metrics/metrics.h>
+#include <memfault/core/trace_event.h>
 #include <memfault_ncs.h>
 #endif
 
@@ -77,6 +79,37 @@ static void metrics_collect(struct k_work *work)
 		/* RF regime (build config) -- fleet filter axes. */
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_carrier, CONFIG_AETHER_DECT_CARRIER);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_power, CONFIG_AETHER_DECT_TX_POWER);
+
+		/* Phase 2: self-organization + ARQ reliability (aephyr counters). */
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_reelections, c->reelections);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_orphans, c->orphans);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_arq_retx, c->arq_retx);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_arq_failed, c->arq_failed);
+
+		/* Datagram service (dect_mesh counters): volume + rxq back-pressure. */
+		uint32_t dtx = 0, drx = 0, drop = 0;
+
+		aether_net_get_stats(&dtx, &drx, &drop);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_data_tx, dtx);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_data_rx, drx);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_rxq_drops, drop);
+
+		/* Trace events on the discrete moments: a counter that stepped since the
+		 * last poll marks a self-heal / orphan / delivery-failure on the timeline. */
+		static uint32_t prev_reel, prev_orph, prev_arqf;
+
+		if (c->reelections > prev_reel) {
+			MEMFAULT_TRACE_EVENT(Dect_Reelection);
+		}
+		if (c->orphans > prev_orph) {
+			MEMFAULT_TRACE_EVENT(Dect_Orphan);
+		}
+		if (c->arq_failed > prev_arqf) {
+			MEMFAULT_TRACE_EVENT(Dect_ArqFailed);
+		}
+		prev_reel = c->reelections;
+		prev_orph = c->orphans;
+		prev_arqf = c->arq_failed;
 	}
 	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(30));
 }

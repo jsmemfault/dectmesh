@@ -792,6 +792,19 @@ static const struct ninep_fs_ops aether_net_ops = {
 const struct ninep_fs_ops *aether_net_get_ops(void) { return &aether_net_ops; }
 void *aether_net_get_ctx(void) { return &g_fs; }
 
+void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops)
+{
+	if (data_tx) {
+		*data_tx = g_fs.ctr.tx;
+	}
+	if (data_rx) {
+		*data_rx = g_fs.ctr.rx;
+	}
+	if (rxq_drops) {
+		*rxq_drops = g_fs.ctr.rx_drop;
+	}
+}
+
 int aether_net_init(struct net_if *iface, const uint8_t myaddr[6])
 {
 	memset(&g_fs, 0, sizeof(g_fs));

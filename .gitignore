@@ -23,3 +23,8 @@ dectfw/
 *.swp
 *.swo
 *~
+
+# Never commit secret tokens (Memfault OAT scratch, etc.)
+oat_dont_commit
+*.token
+*secret*
