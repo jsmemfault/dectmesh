@@ -9,11 +9,14 @@
  *
  * Stage 1 (this file): the private key is a 32-byte scalar seed, generated once
  * on first boot from the CSPRNG and persisted in app-managed settings/NVS ("NVS
- * management of the key for now"). Each boot the seed is imported as a VOLATILE
- * PSA keypair (no persistent-key backend / TF-M ITS needed on this minimal-TF-M
- * build) purely to derive the public key -> address. The keypair carries
- * SIGN_HASH usage so Stage 2 can add an ownership-proof signature over the same
- * identity without changing the key.
+ * management of the key for now"). Each boot the public key is derived from the
+ * seed (pubkey = seed*G) to recompute the address.
+ *
+ * We call the Oberon ocrypto P-256 primitive directly rather than going through
+ * the PSA keystore: psa_import_key of a raw scalar returned NOT_SUPPORTED (-134)
+ * from the PSA policy layer on this build, and the raw primitive is the same
+ * math with none of that indirection. ocrypto_ecdsa_p256_sign() (same seed) is
+ * ready for the Stage-2 ownership proof.
  *
  * Future state (TF-M): move the seed into the secure enclave (PSA persistent key
  * in ITS) so it never lives in app flash. The address derivation is unchanged.
@@ -23,7 +26,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/net/aether_mesh.h>
 #include <zephyr/settings/settings.h>
-#include <psa/crypto.h>
+#include <psa/crypto.h>            /* psa_generate_random() for the seed */
+#include <ocrypto_ecdsa_p256.h>   /* pubkey = seed*G, no PSA keystore */
+#include <ocrypto_sha256.h>
 #include <string.h>
 #include <zephyr/logging/log.h>
 
@@ -55,8 +60,25 @@ static int cga_seed_set(const char *name, size_t len,
 }
 SETTINGS_STATIC_HANDLER_DEFINE(cga, "cga", NULL, cga_seed_set, NULL, NULL);
 
-/* Load the persisted identity seed, or generate + persist one on first boot. */
-static int cga_load_seed(void)
+/* Draw a fresh seed that is a valid P-256 scalar (the ocrypto-recommended
+ * do/while), leaving the derived public key in pub[64]. */
+static int cga_new_seed(uint8_t pub[64])
+{
+	for (int tries = 0; tries < 8; tries++) {
+		if (psa_generate_random(cga_seed, CGA_SEED_LEN) != PSA_SUCCESS) {
+			return -EIO;
+		}
+		if (ocrypto_ecdsa_p256_public_key(pub, cga_seed) == 0) {
+			return 0;   /* valid scalar */
+		}
+	}
+	return -EIO;   /* astronomically unlikely */
+}
+
+/* Establish the identity seed and derive its public key into pub[64]:
+ * load the persisted seed (self-healing if it is missing or invalid), else
+ * generate + persist a fresh one on first boot. */
+static int cga_identity_pubkey(uint8_t pub[64])
 {
 	int err = settings_subsys_init();
 
@@ -65,12 +87,15 @@ static int cga_load_seed(void)
 		return err;
 	}
 	(void)settings_load_subtree("cga");
+
+	if (cga_have_seed && ocrypto_ecdsa_p256_public_key(pub, cga_seed) == 0) {
+		return 0;   /* persisted, valid -> stable address across reboots */
+	}
 	if (cga_have_seed) {
-		return 0;
+		LOG_WRN("persisted CGA seed invalid -- regenerating");
 	}
 
-	/* First boot: draw a fresh CSPRNG seed and persist it. */
-	if (psa_generate_random(cga_seed, CGA_SEED_LEN) != PSA_SUCCESS) {
+	if (cga_new_seed(pub) < 0) {
 		LOG_ERR("CSPRNG seed failed");
 		return -EIO;
 	}
@@ -84,55 +109,20 @@ static int cga_load_seed(void)
 	return 0;
 }
 
-/* pubkey = seed*G, via a transient PSA keypair imported from the seed scalar. */
-static int cga_pubkey(uint8_t *pub, size_t pub_size, size_t *publen)
-{
-	psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-
-	psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
-	psa_set_key_bits(&attr, 256);
-	psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH);   /* for Stage 2 */
-	psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
-
-	psa_key_id_t key;
-	psa_status_t st = psa_import_key(&attr, cga_seed, CGA_SEED_LEN, &key);
-
-	if (st != PSA_SUCCESS) {
-		LOG_ERR("import seed: %d", (int)st);
-		return -EIO;
-	}
-	/* Exporting the PUBLIC half of a keypair needs no EXPORT usage flag. */
-	st = psa_export_public_key(key, pub, pub_size, publen);
-	psa_destroy_key(key);
-	if (st != PSA_SUCCESS) {
-		LOG_ERR("export pubkey: %d", (int)st);
-		return -EIO;
-	}
-	return 0;
-}
-
 /* aephyr hook: node_eui = SHA256(pubkey)[:6], locally-administered unicast. */
 int aether_node_identity_override(uint8_t out[6])
 {
-	uint8_t pub[65];   /* P-256 uncompressed public key: 04 || X || Y = 65 bytes */
+	uint8_t pub[64];   /* P-256 public key, raw X || Y */
 	uint8_t hash[32];
-	size_t publen = 0, hlen = 0;
 
 	if (psa_crypto_init() != PSA_SUCCESS) {
 		LOG_WRN("PSA init failed -- falling back to non-persistent identity");
 		return -EIO;
 	}
-	if (cga_load_seed() < 0) {
+	if (cga_identity_pubkey(pub) < 0) {
 		return -EIO;
 	}
-	if (cga_pubkey(pub, sizeof(pub), &publen) < 0) {
-		return -EIO;
-	}
-	if (psa_hash_compute(PSA_ALG_SHA_256, pub, publen,
-			     hash, sizeof(hash), &hlen) != PSA_SUCCESS || hlen < 6) {
-		LOG_ERR("SHA256(pubkey) failed");
-		return -EIO;
-	}
+	ocrypto_sha256(hash, pub, sizeof(pub));
 
 	memcpy(out, hash, 6);
 	out[0] = (uint8_t)((out[0] | 0x02) & 0xFE);   /* locally-administered unicast */
