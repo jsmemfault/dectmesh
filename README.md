@@ -11,8 +11,7 @@ write with generic, decades-old tooling, over USB / BLE / UART / TCP / or across
 > fleet telemetry — a pile of moving parts with every right to be the middle word. It's the
 > last one instead, and the reason has a name: **9P.** The same read/write verbs compose a
 > console, a firmware slot, a chat room, a coredump stream, cryptographic identity, and a
-> node two hops away — one hand, many tricks. That's not a garnish on the project; it *is*
-> the project. **DECTstrous by name, dexterous by 9P.**
+> node two hops away — one hand, many tricks.  **DECTstrous by name, dexterous by 9P.**
 
 Two chips on a Thingy:91 X, two apps:
 
