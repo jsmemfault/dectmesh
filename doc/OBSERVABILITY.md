@@ -23,35 +23,44 @@ reboot reasons, traces, and coredumps into transport-agnostic **chunks**. We jus
 to move the chunks — and everything in this project is a file, so the chunks are a file
 too:
 
+**Both chips are instrumented**, and the relay **multiplexes both chunk streams into its
+one 9P namespace** — so a single forwarder drains two devices' telemetry over one
+connection:
+
 ```mermaid
 flowchart LR
-    subgraph NODE["nRF9151 — mesh node"]
-      mflt["Memfault SDK<br/>metrics · reboots · coredumps"]
-      f["chunks exposed as a file<br/><b>/dev/mflt</b> (9P)"]
-      mflt --> f
+    subgraph N91["nRF9151 — mesh node"]
+      m91["Memfault SDK"] --> f91["<b>dev/mflt</b> (9P)"]
     end
-    subgraph RELAY["nRF5340 — relay"]
-      agg["9P aggregator<br/>re-exports /dev/fw9151mflt"]
+    subgraph N53["nRF5340 — relay"]
+      m53["Memfault SDK"] --> f53["<b>dev/mflt5340</b>"]
+      p91["<b>dev/mflt9151</b><br/>proxy over mesh link"]
+      f53 --> ns(["composed 9P namespace"])
+      p91 --> ns
     end
     subgraph HOST["host / gateway"]
-      fwd["tools/mflt_forward.sh<br/>read chunks · POST"]
+      fwd["mflt_forward.sh<br/>drain both · POST"]
     end
-    cloud["☁️ Memfault<br/>fleet · charts · alerts · coredumps"]
-    f -->|9P over uart1| agg -->|9P over USB / BLE| fwd -->|HTTPS chunks API| cloud
+    cloud["☁️ Memfault<br/>two devices — by CGA + relay id"]
+    f91 -->|9P over uart1| p91
+    ns -->|9P over USB / BLE| fwd -->|chunks API| cloud
 ```
 
-- **On-node:** expose `memfault_packetizer_get_chunk()` output as a read-only 9P file
-  (`/dev/mflt`), alongside the shell's existing `mflt export`. Reading the file drains
-  pending chunks — *observability by construction*, same as every other capability.
-- **Off-node:** the relay re-exports it (it already re-exports `/dev/fw9151`); a small
-  host/gateway forwarder (`tools/mflt_forward.sh`) reads the chunks and `POST`s them to
-  Memfault's chunks endpoint on a timer. On a real deployment the **relay or an
-  nRF9160/91 gateway** with LTE does the POST; on the bench the tethered host does.
-- **No new protocol.** The chunk file rides the exact same 9P transports (UART, USB,
-  BLE L2CAP) as everything else. Add observability → add a file.
+- **Both chips packetize.** The 9151 exposes its chunks as `dev/mflt`; the relay exposes
+  its own (coredumps, reboot reasons, metrics) as `dev/mflt5340` and **proxies the 9151's
+  over the inter-chip mesh link** as `dev/mflt9151`. Reading a file drains its chunks.
+- **Self-describing streams.** Each emits a `DEV:<serial>:` line before its `MC:<base64>:`
+  chunks (the 9151's serial is its CGA; the relay's is `dect-relay-<hwid>`), so one generic
+  forwarder POSTs any chip's chunks to the right device without being told who it is.
+- **One forwarder, one namespace, two chips.** `tools/mflt_forward.sh` drains
+  `dev/mflt5340` + `dev/mflt9151` over a single 9P connection and POSTs to Memfault. On the
+  bench the tethered host runs it; in the field an LTE gateway does. The existing relay
+  `mflt export` console command stays — for manual triage only.
 
-> **This is the pitch made literal:** the observability story isn't bolted on — it falls
-> out of the filesystem model. That's the sentence that lands with a Memfault-owned org.
+> **The 9P thesis, standalone.** Two chips' coredumps and metrics, pulled through *one
+> composed namespace* over the multiplexed UART/USB link — no per-device telemetry code,
+> no second protocol. This sells the filesystem-composition idea *entirely apart* from the
+> DECT mesh: observability falls out of the model.
 
 ## Metric catalog — mapped to the claim each one backs
 
@@ -152,9 +161,11 @@ refreshed from real devices — exactly the "log in and see it" experience.
   the **CGA** (`dect-<node_eui>` — cryptographic identity = fleet device name), plus the
   harvested metrics — `dect_is_root`, `dect_rssi`, `dect_snr`, `dect_tx_err`, `dect_rx_err`,
   `dect_carrier`, `dect_tx_power` — on top of the original 8. No aephyr changes.
-- **Pipeline — DONE (built):** `dev/mflt` is a 9P file (`aether_9p.c`) that drains Memfault
-  chunks as `MC:<base64>:` lines; `tools/mflt_forward.sh` reads it over 9P and POSTs each
-  chunk to the Memfault chunks API (device serial = the CGA).
+- **Pipeline — DONE (built), both chips:** the 9151 exposes `dev/mflt` (`aether_9p.c`); the
+  relay exposes its own `dev/mflt5340` and proxies the 9151's as `dev/mflt9151` (both in
+  `dect_relay/main.c`), and sets its serial to `dect-relay-<hwid>`. Each stream is
+  self-describing (`DEV:<serial>:` + `MC:<base64>:`), and `tools/mflt_forward.sh` drains
+  both over one 9P connection and POSTs to Memfault.
 - **To go live (needs your input):** set `CONFIG_MEMFAULT_NCS_PROJECT_KEY` (or pass the key
   to the forwarder), OTA the 0.7.39 image, and run `MEMFAULT_PROJECT_KEY=… mflt_forward.sh
   <9P port>` → **real data in Memfault.** Then build the dashboard above.

@@ -34,6 +34,10 @@
 #include <zephyr/9p/sysfs.h>
 #include <zephyr/9p/union_fs.h>
 #include <zephyr/9p/remote_fs.h>
+#if defined(CONFIG_MEMFAULT)
+#include <memfault/core/data_packetizer.h>
+#include <memfault_ncs.h>
+#endif
 #include "aether_conv_transport.h"
 #include <zephyr/9p/dfu.h>
 #include <zephyr/9p/client.h>
@@ -1226,6 +1230,79 @@ static int fw9151auto_write(const uint8_t *buf, uint32_t count, uint64_t off, vo
 	return (int)count;
 }
 
+#if defined(CONFIG_MEMFAULT)
+static char relay_serial[24];   /* "dect-relay-<hwid>" -- Memfault device id */
+
+/* Base64-encode n bytes of `in` into `out` (no NUL); returns bytes written. */
+static int b64enc(const uint8_t *in, size_t n, char *out)
+{
+	static const char t[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	int o = 0;
+
+	for (size_t i = 0; i < n; i += 3) {
+		uint32_t v = (uint32_t)in[i] << 16 |
+			     (uint32_t)(i + 1 < n ? in[i + 1] : 0) << 8 |
+			     (uint32_t)(i + 2 < n ? in[i + 2] : 0);
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		out[o++] = (i + 1 < n) ? t[(v >> 6) & 63] : '=';
+		out[o++] = (i + 2 < n) ? t[v & 63] : '=';
+	}
+	return o;
+}
+
+/* dev/mflt5340 -- drain THIS relay's own Memfault chunks (coredumps, reboot
+ * reasons, metrics) as "DEV:<serial>:" + "MC:<base64>:" lines. Same wire format
+ * as the 9151's dev/mflt, so the single forwarder handles both identically. */
+static int mflt5340_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (off || !memfault_packetizer_data_available()) {
+		return 0;
+	}
+	int total = snprintf((char *)buf, buf_size, "DEV:%s:\n", relay_serial);
+	uint8_t chunk[192];
+
+	while (memfault_packetizer_data_available()) {
+		if (total + 270 > (int)buf_size) {
+			break;
+		}
+		size_t clen = sizeof(chunk);
+
+		if (!memfault_packetizer_get_chunk(chunk, &clen)) {
+			break;
+		}
+		buf[total++] = 'M'; buf[total++] = 'C'; buf[total++] = ':';
+		total += b64enc(chunk, clen, (char *)buf + total);
+		buf[total++] = ':'; buf[total++] = '\n';
+	}
+	return total;
+}
+
+/* dev/mflt9151 -- proxy the 9151's dev/mflt over the mesh client. It arrives
+ * already self-describing (DEV: line with the 9151's CGA + MC: chunks), so this
+ * is a pure pass-through. THIS is the thesis: the relay composes both chips'
+ * chunk streams into ONE 9P namespace, drained by a single forwarder over the
+ * multiplexed UART/USB link -- no per-device telemetry code. */
+static int mflt9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	uint32_t fid;
+	int ret = fw9151_open_remote("dev/mflt", NINEP_OREAD, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret;
+}
+#endif /* CONFIG_MEMFAULT */
+
 /*
  * The 9151's /net/aether is no longer re-exported as a curated, per-file sysfs
  * proxy. It is now a *dynamic* datagram tree (clone/ctl/data conversations, per
@@ -1266,6 +1343,18 @@ static int fw_9p_init(void)
 			LOG_INF("qid salt = %08x%08x",
 				(uint32_t)(qid_salt >> 32), (uint32_t)qid_salt);
 		}
+#if defined(CONFIG_MEMFAULT) && defined(CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME)
+		if (dn >= 4) {
+			int sl = snprintf(relay_serial, sizeof(relay_serial),
+					  "dect-relay-%02x%02x%02x%02x",
+					  devid[0], devid[1], devid[2], devid[3]);
+
+			if (sl > 0 && sl < (int)sizeof(relay_serial)) {
+				(void)memfault_ncs_device_id_set(relay_serial, sl);
+				LOG_INF("Memfault device id: %s", relay_serial);
+			}
+		}
+#endif
 	}
 	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/reboot",
 						 NULL, fw_write_reboot, NULL);
@@ -1287,6 +1376,15 @@ static int fw_9p_init(void)
 	/* dev/link9151: read-only 5340<->9151 link health (instant, never proxied). */
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/link9151",
 					link9151_read, NULL);
+
+#if defined(CONFIG_MEMFAULT)
+	/* Both chips' Memfault chunk streams composed into this ONE namespace: the
+	 * relay's own (dev/mflt5340) and the 9151's proxied over the mesh client
+	 * (dev/mflt9151). A single forwarder (tools/mflt_forward.sh) drains both and
+	 * POSTs to Memfault -- coredumps + metrics from two chips, one 9P interface. */
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt5340", mflt5340_read, NULL);
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt9151", mflt9151_read, NULL);
+#endif
 
 	/* dev/fw9151auto: toggle post-swap auto-confirm of the 9151 (default on). */
 	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/fw9151auto",

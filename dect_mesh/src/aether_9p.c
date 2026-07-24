@@ -396,11 +396,22 @@ static int b64enc(const uint8_t *in, size_t n, char *out)
 static int gen_mflt(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 {
 	ARG_UNUSED(ctx);
-	if (offset) {
-		return 0;   /* one drain per read op (fresh reads have offset 0) */
+	if (offset || !memfault_packetizer_data_available()) {
+		return 0;   /* one drain per read op; empty when nothing pending */
 	}
 	int total = 0;
 	uint8_t chunk[192];
+
+	/* Self-describing: which Memfault device these chunks belong to. The serial
+	 * is this node's CGA, matching the id set in dect_metrics.c -- so one generic
+	 * forwarder can POST any node's chunks without being told who it is. */
+	if (g_mesh_ctx) {
+		const uint8_t *e = g_mesh_ctx->node_eui;
+
+		total += snprintf((char *)buf, buf_size,
+				  "DEV:dect-%02x%02x%02x%02x%02x%02x:\n",
+				  e[0], e[1], e[2], e[3], e[4], e[5]);
+	}
 
 	while (memfault_packetizer_data_available()) {
 		/* get_chunk is destructive, so ensure the encoded line fits first:

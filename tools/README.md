@@ -28,7 +28,7 @@ top-level `README.md` for the bridge pattern). C tools are single-file; build wi
 
 | Tool | What it does |
 |------|--------------|
-| `mflt_forward.sh` | Reads a node's Memfault chunks from the `dev/mflt` 9P file and POSTs them to the Memfault cloud (device serial = the node's CGA). The bench stand-in for a field gateway. `MEMFAULT_PROJECT_KEY=<key> mflt_forward.sh <9P port> [interval]`. See `doc/OBSERVABILITY.md`. |
+| `mflt_forward.sh` | Drains **both chips'** Memfault chunks from the relay's composed 9P namespace (`dev/mflt5340` + the proxied `dev/mflt9151`) over one connection and POSTs them to Memfault. Each stream is self-describing (`DEV:<serial>:`), so one loop handles both. The bench stand-in for a field LTE gateway. `MEMFAULT_PROJECT_KEY=<key> mflt_forward.sh <relay 9P port> [interval]`. See `doc/OBSERVABILITY.md`. |
 
 ## Native chat client — `achat/`
 
