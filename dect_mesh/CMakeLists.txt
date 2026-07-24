@@ -16,6 +16,7 @@ zephyr_include_directories(config)
 
 target_sources(app PRIVATE src/main.c)
 target_sources(app PRIVATE src/aether_led.c)
+target_sources_ifdef(CONFIG_AETHER_CGA app PRIVATE src/cga.c)
 target_sources_ifdef(CONFIG_NINEP app PRIVATE src/aether_9p.c)
 target_sources_ifdef(CONFIG_NINEP app PRIVATE src/aether_9p_mesh.c)
 target_sources_ifdef(CONFIG_NINEP app PRIVATE src/aether_net.c)

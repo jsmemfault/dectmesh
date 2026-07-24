@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+
+config AETHER_CGA
+	bool "Cryptographically Generated Address (persistent node identity)"
+	help
+	  Derive the durable node_eui from a persistent P-256 keypair held as a
+	  PSA persistent key (TF-M Internal Trusted Storage), so the Aether address
+	  survives reboots and the private key stays in the secure enclave.
+	  Requires PSA crypto (a non-minimal TF-M profile).
+
+source "Kconfig.zephyr"
