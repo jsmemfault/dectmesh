@@ -64,6 +64,11 @@ per-feature protocol, no SDK per metric. Demonstrated end-to-end on hardware:
 - It's a 40-year-old idea (Plan 9) applied to embedded fleet management — and it's exactly what keeps
   the observability story below simple as the fleet grows.
 
+*The name is the argument in miniature: **DECT** + *disastrous* + *dexterous*. A two-MCU,
+four-transport, self-healing, self-updating, self-observing radio stack has every right to be the
+middle word. 9P is why it's the last one — one set of verbs (`read`/`write`) does console, OTA, chat,
+coredumps, identity, and a node two hops away. **DECTstrous by name, dexterous by 9P.***
+
 **Pillar 3 — cryptographic node identity, self-certifying, and *also* a file.**  *(shipped since the last update)*
 Every node's durable address is now a **Cryptographically Generated Address**: `node_eui =
 SHA256(pubkey)[:6]`, bound to a **P-256 keypair the node owns** and persists across reboots (and a full

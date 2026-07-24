@@ -6,6 +6,14 @@ that its **entire control surface is a 9P filesystem**: live mesh state, firmwar
 link health, **cryptographic identity**, and control are all just *files* you read and
 write with generic, decades-old tooling, over USB / BLE / UART / TCP / or across the mesh itself.
 
+> **Why "DECTstrous"?** The name is a three-way wink — **DECT** + *disastrous* + *dexterous*.
+> Two MCUs, four transports, a self-healing multi-hop mesh, over-the-air updates, and live
+> fleet telemetry — a pile of moving parts with every right to be the middle word. It's the
+> last one instead, and the reason has a name: **9P.** The same read/write verbs compose a
+> console, a firmware slot, a chat room, a coredump stream, cryptographic identity, and a
+> node two hops away — one hand, many tricks. That's not a garnish on the project; it *is*
+> the project. **DECTstrous by name, dexterous by 9P.**
+
 Two chips on a Thingy:91 X, two apps:
 
 - **`DECTstrous Mesh`** (nRF9151) — the Æther/HONR mesh on the DECT NR+ PHY, with an
