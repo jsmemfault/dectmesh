@@ -220,6 +220,7 @@ against the claimed address **and** the ECDSA-P256 signature. An impostor presen
 | **`doc/NET_AETHER_SPEC.md`** | The `/net/aether` datagram-service spec (Plan 9 `/net`-style clone/ctl/data) |
 | **`doc/PROOF.md`** | Proof dossier — the on-hardware transcripts behind every claim (multi-hop, CGA persistence, ownership proof + spoof rejection) |
 | **`doc/RF_CHARACTERIZATION.md`** | SDR measurement methodology + log — on-air behavior (duty cycle, occupied bandwidth, LBT) as the near-term regulatory rigor toward certification |
+| **`doc/OBSERVABILITY.md`** | Fleet observability spec — the Memfault metrics/attributes/traces mapped to each claim, the 9P-chunk upload pipeline, and the dashboard a reviewer sees |
 | **`tools/`** | Host-side 9P clients, proof/test scripts, and the native chat client (`tools/README.md`) |
 | **`dectfw/`** | Licensed DECT NR+ PHY modem firmware (access-gated — **never commit**) |
 | **`NRplus-mesh-*.md`** | Pitch / role / demo-script — the project one-pager and how I'd lead it |
