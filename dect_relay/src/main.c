@@ -313,6 +313,14 @@ static const struct ninep_client_config mesh_client_cfg = {
 	 * RX bytes arrive but sometimes just past a tight deadline (seen: isr got
 	 * all 19 Rversion bytes yet the 5s version still timed out). Be generous. */
 	.timeout_ms = 20000,
+	/* A connected /net/aether data read blocks on the 9151 until the peer's
+	 * next datagram -- i.e. until the human on the other end types. Capping that
+	 * at 20s left a parked read worker that stole the next datagram, so any
+	 * conversational pause > ~20s silently broke the receive path (bisection:
+	 * 10s gaps fine, 30s gaps broke, then cascaded). Give reads a deadline far
+	 * above any real chat pause so a normal gap never trips it; link ops keep
+	 * the fast 20s above for prompt dead-link detection. */
+	.read_timeout_ms = 300000,   /* 5 min */
 };
 static uint32_t mesh_root_fid;
 static bool mesh_attached;
