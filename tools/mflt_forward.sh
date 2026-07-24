@@ -75,17 +75,18 @@ read_peer() {  # <peer-cga> -> peer's DEV:/MC: text on stdout (BOUNDED time)
 	# Bounded wait for the bridge endpoint; bail early if aether_conv already exited
 	# (connect failed = peer unreachable / out of range this cycle).
 	i=0
-	while [ ! -S "$psock" ] && kill -0 $bpid 2>/dev/null && [ $i -lt 8 ]; do
+	while [ ! -S "$psock" ] && kill -0 $bpid 2>/dev/null && [ $i -lt 10 ]; do
 		sleep 1; i=$((i + 1))
 	done
 	if [ -S "$psock" ]; then
-		# The mesh round-trip can STALL if the peer roams out of range mid-read, so
-		# cap the read with a watchdog instead of letting it block the whole cycle
-		# (and the gateway's own telemetry behind it).
+		# Draining dev/mflt over the mesh is several reliable-unicast round-trips
+		# (version/attach/walk/open/read...), each slower as the link weakens with
+		# distance, so give it a generous window -- but still bounded so a peer that
+		# roamed out of range mid-read can't block the cycle.
 		"$P9" "$psock" rd:dev/mflt >"$psock.out" 2>/dev/null &
 		rpid=$!
 		j=0
-		while kill -0 $rpid 2>/dev/null && [ $j -lt 10 ]; do sleep 1; j=$((j + 1)); done
+		while kill -0 $rpid 2>/dev/null && [ $j -lt 22 ]; do sleep 1; j=$((j + 1)); done
 		kill -9 $rpid 2>/dev/null; wait $rpid 2>/dev/null
 		cat "$psock.out" 2>/dev/null
 	fi
@@ -125,7 +126,14 @@ forward_cycle() {
 	# for the whole run instead of cycling it every cycle -- repeated open/close of
 	# the CDC port is exactly what wedges it. Bridges still need their own socat.
 	[ "$HELD" = 1 ] || bring_socat
-	own=$("$P9" "$SOCK" rd:dev/mflt5340 rd:dev/mflt9151 rd:dev/aether/neighbors 2>/dev/null)
+	# Watchdog the gateway read too: if the relay<->9151 uart link is desynced, the
+	# proxied 9151 read can hang -- bound it so a bad cycle fails fast instead of
+	# stalling an unattended monitor.
+	"$P9" "$SOCK" rd:dev/mflt5340 rd:dev/mflt9151 rd:dev/aether/neighbors >"$SOCK.own" 2>/dev/null &
+	op=$!; c=0
+	while kill -0 $op 2>/dev/null && [ $c -lt 15 ]; do sleep 1; c=$((c + 1)); done
+	kill -9 $op 2>/dev/null; wait $op 2>/dev/null
+	own=$(cat "$SOCK.own" 2>/dev/null); rm -f "$SOCK.own"
 	[ "$HELD" = 1 ] || drop_socat
 	post_tokens "$own"
 
