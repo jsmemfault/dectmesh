@@ -41,3 +41,14 @@ MEMFAULT_METRICS_KEY_DEFINE(dect_arq_failed, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_data_tx, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_data_rx, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_rxq_drops, kMemfaultMetricType_Unsigned)
+
+/* Phase 2c: live DECT NR+ PHY telemetry, read straight from the modem via the
+ * driver's dect_phy_get_stats(). tx_ok/lbt_busy/rx are the RF outcomes (LBT ties
+ * to doc/RF_CHARACTERIZATION.md); temp/voltage are the modem's own thermal +
+ * supply readings — real battery/thermal health for the roaming field node. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_tx_ok, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_lbt_busy, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rx_pcc, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rx_frames, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_temp, kMemfaultMetricType_Signed)
+MEMFAULT_METRICS_KEY_DEFINE(dect_voltage, kMemfaultMetricType_Unsigned)

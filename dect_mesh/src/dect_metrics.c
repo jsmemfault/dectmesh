@@ -19,6 +19,10 @@
 #include <zephyr/net/net_if.h>
 #include <stdio.h>
 
+/* DECT PHY driver (aephyr) — live modem telemetry: LBT, tx_ok, temp, voltage. */
+#include <dect_phy.h>
+#include <nrf_modem_dect_phy.h> /* NRF_MODEM_DECT_PHY_TEMP_NOT_MEASURED sentinel */
+
 #if defined(CONFIG_MEMFAULT)
 #include <memfault/metrics/metrics.h>
 #include <memfault/core/trace_event.h>
@@ -80,6 +84,23 @@ static void metrics_collect(struct k_work *work)
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_carrier, CONFIG_AETHER_DECT_CARRIER);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_power, CONFIG_AETHER_DECT_TX_POWER);
 
+		/* Phase 2c: live DECT NR+ PHY telemetry, straight from the modem. LBT
+		 * deferrals + tx/rx outcomes (RF characterization), and the modem's own
+		 * temperature + supply voltage (thermal/battery health in the field). */
+		struct dect_phy_stats ps;
+
+		dect_phy_get_stats(&ps);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_ok, ps.tx_ok);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_lbt_busy, ps.tx_busy);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_rx_pcc, ps.rx_pcc);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_rx_frames, ps.rx_frames);
+		if (ps.last_temp_c != NRF_MODEM_DECT_PHY_TEMP_NOT_MEASURED) {
+			MEMFAULT_METRIC_SET_SIGNED(dect_temp, ps.last_temp_c);
+		}
+		if (ps.last_voltage_mv != 0) {
+			MEMFAULT_METRIC_SET_UNSIGNED(dect_voltage, ps.last_voltage_mv);
+		}
+
 		/* Phase 2: self-organization + ARQ reliability (aephyr counters). */
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_reelections, c->reelections);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_orphans, c->orphans);
@@ -111,7 +132,10 @@ static void metrics_collect(struct k_work *work)
 		prev_orph = c->orphans;
 		prev_arqf = c->arq_failed;
 	}
-	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(30));
+	/* High-resolution cadence for the roaming field test: sample every 15 s so a
+	 * 15 s heartbeat never reports a stale snapshot (see CONFIG_MEMFAULT_METRICS_
+	 * HEARTBEAT_INTERVAL_SECS in prj.conf). */
+	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(15));
 }
 static K_WORK_DELAYABLE_DEFINE(metrics_work, metrics_collect);
 #endif /* CONFIG_MEMFAULT */
