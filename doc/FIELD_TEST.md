@@ -52,13 +52,20 @@ flowchart LR
 1. **Gateway self-telemetry — WORKS TODAY.** Node A's relay multiplexes *its own* two chips
    (`dev/mflt5340` + `dev/mflt9151`) into one 9P namespace; `tools/mflt_forward.sh` drains
    both over one connection and POSTs to Memfault. Two devices, one forwarder.
-2. **Mesh-relayed telemetry — the new capability (building).** Node A's 9151 mounts Node
-   B's `dev/mflt` **over the DECT mesh** (the proven 9P-over-mesh path) and re-exposes it as
-   `dev/mesh/<B-cga>/mflt` in the gateway namespace. The forwarder discovers it like any
-   other stream. Because every chunk stream is **self-describing** (`DEV:dect-<CGA>:` before
-   its `MC:` chunks), B's data POSTs to **B's** Memfault device automatically — the forwarder
-   needs no per-node config. *Building block in place (9P-over-mesh proven); wiring in
-   progress.*
+2. **Mesh-relayed telemetry — WORKS.** List a mobile node's CGA in `MESH_PEERS` and each
+   cycle the forwarder tunnels a 9P session through Node A's conversation layer to that
+   peer's **mesh 9P server** (`aether_conv --bridge`, addressed by durable CGA so routing
+   re-resolves as the node roams) and drains its `dev/mflt` **over the DECT mesh**. `dev/mflt`
+   is already served over the mesh on every node (the mesh 9P server shares the same
+   namespace), so **Node B needs zero firmware change**. Because every stream is
+   **self-describing** (`DEV:dect-<CGA>:` before its `MC:` chunks), B's data POSTs to **B's**
+   Memfault device automatically. Proven end-to-end: Node B's chunks reach Memfault (HTTP
+   200) through Node A over the air, no tether. Run it:
+   ```sh
+   MESH_PEERS="<B-cga e.g. 36:0a:45:63:c7:17>" \
+     MEMFAULT_PROJECT_KEY=<key> tools/mflt_forward.sh <A 9P port> 15
+   # cycle summary tallies chunks per device: "...: 2xdect-<A> 1xdect-<B> 2xdect-relay-<A>"
+   ```
 
 > **Why this is the whole thesis at once:** 9P-over-mesh (the mesh carries a real session,
 > not just chat) + namespace composition (B's files appear inside A's tree) + self-certifying
