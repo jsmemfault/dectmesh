@@ -62,6 +62,15 @@ flowchart LR
 > no second protocol. This sells the filesystem-composition idea *entirely apart* from the
 > DECT mesh: observability falls out of the model.
 
+**And then over the mesh.** The same `dev/mflt` file is served over the **mesh** 9P server
+too (same namespace, reliable-unicast transport). So a **mobile node with no host of its
+own** — battery, no USB, no LTE — still reports to the cloud: the forwarder tunnels a 9P
+session through the tethered gateway to the roaming node (addressed by durable CGA) and
+drains *its* `dev/mflt` **over the DECT mesh**. A quarter-mile-away node's coredumps and RF
+metrics land in Memfault, keyed to its own CGA, having crossed the air with **zero node-side
+telemetry code**. This is the field-test climax — 9P-over-mesh + namespace composition +
+self-certifying identity, all doing production work at once. *(See `doc/FIELD_TEST.md`.)*
+
 ## Metric catalog — mapped to the claim each one backs
 
 Heartbeat metrics (reported every interval). **Source** shows where the value comes
@@ -98,13 +107,18 @@ from: *ctx* = `aether_mesh_ctx` (harvested today), *heymac* = HeyMac L2 context
 | `dect_rxq_full_drops` | uint | new | conversation rxq overflow — the load/back-pressure signal from the inter-chip work |
 
 ### RF / PHY health (DECT NR+)  — *"PHY-aware, and honest about the air"*
+Read live from the modem via the driver's `dect_phy_get_stats()` / `dect_phy_get_info()`.
 | Metric | Type | Source | Backs / signals |
 |--------|------|--------|-----------------|
-| `dect_rssi_last` | int | heymac | link signal strength |
-| `dect_snr_last` | int | heymac | link quality |
-| `dect_tx_ok` / `dect_tx_err` | uint | heymac/new | PHY transmit outcomes |
-| `dect_lbt_busy` | uint | new | **listen-before-talk deferrals** — channel contention; ties to `doc/RF_CHARACTERIZATION.md` |
-| `dect_tx_airtime_ms` | uint | new | transmit on-time per interval → **live duty-cycle proxy** (regulatory relevance) |
+| `dect_rssi` / `dect_snr` | int | heymac ✓ | link signal strength / quality |
+| `dect_tx_ok` | uint | PHY ✓ | frames the modem transmitted successfully |
+| `dect_lbt_busy` | uint | PHY ✓ | **listen-before-talk deferrals** — channel contention; ties to `doc/RF_CHARACTERIZATION.md` |
+| `dect_rx_pcc` / `dect_rx_frames` | uint | PHY ✓ | control headers / data frames seen off-air |
+| `dect_temp` | int | PHY ✓ | **modem temperature (°C)** — thermal health in the field/sun |
+| `dect_voltage` | uint | PHY ✓ | **modem supply (mV)** — battery proxy for the roaming node |
+| `dect_tx_bytes` / `dect_rx_bytes` | uint | PHY ✓ | cumulative payload moved (relayed frames included) |
+| `dect_tx_bps` / `dect_rx_bps` | uint | PHY ✓ | **Aether throughput** — bits/sec over the interval, computed on-device |
+| `dect_carrier` / `dect_carrier_decoded` | uint/str | PHY ✓ | raw carrier + pretty **"band 4, 914.976 MHz"** (decoded live from the band table) |
 
 ### 9P / inter-chip control plane  — *"the filesystem stays up"*
 | Metric | Type | Source | Backs / signals |
@@ -175,9 +189,22 @@ refreshed from real devices — exactly the "log in and see it" experience.
   `aether_net`. And **trace events** — `Dect_Reelection`, `Dect_Orphan`, `Dect_ArqFailed`
   — emitted from `dect_metrics.c` when a counter steps (aephyr stays Memfault-free; the
   app translates counter deltas into timeline events).
-- **Phase 2b (still to do):** the driver-level RF counters (`lbt_busy`, `tx_airtime_ms`,
-  `tx_ok`) need hooks in the DECT PHY driver; and 9P/inter-chip counters (`9p_requests`,
-  `link_resyncs`, `link_wedges`) in 9p4z.
+- **Phase 2c — DONE (dect_mesh 0.7.43):** live DECT NR+ **PHY telemetry** read straight
+  from the modem via the driver's `dect_phy_get_stats()`/`dect_phy_get_info()` (aephyr
+  exposes `drivers/dect/dect_phy.h` on the app include path): `dect_tx_ok`, `dect_lbt_busy`,
+  `dect_rx_pcc`, `dect_rx_frames`, `dect_temp` (modem °C), `dect_voltage` (supply mV), the
+  **Aether-throughput** pair `dect_tx_bytes`/`dect_rx_bytes` + `dect_tx_bps`/`dect_rx_bps`
+  (bits/sec computed on-device from the byte delta over the collector tick), and
+  `dect_carrier_decoded` (a string, decoded live to e.g. *"band 4, 914.976 MHz"*). Cadence
+  tightened to **15 s** (collector + heartbeat) for the roaming field test.
+- **Mesh-relayed telemetry — DONE (`tools/mflt_forward.sh`):** a mobile, untethered node's
+  chunks reach the cloud **through the mesh**. `dev/mflt` is served over the mesh 9P server
+  on every node (same namespace), so the forwarder tunnels a 9P session through the gateway
+  to a peer (by durable CGA) and drains its `dev/mflt` over reliable unicast — **zero node-
+  side change.** Proven: Node B → DECT mesh → gateway → host → Memfault, keyed to B's CGA.
+- **Phase 2b (still to do):** 9P/inter-chip counters (`9p_requests`, `link_resyncs`,
+  `link_wedges`) in 9p4z; and the transmit-airtime duty-cycle metric (the on-device
+  complement to the SDR captures in `doc/RF_CHARACTERIZATION.md`).
 
 ## References
 `../dect_mesh/src/dect_metrics.c`, `../dect_mesh/config/memfault_metrics_heartbeat_config.def`,
