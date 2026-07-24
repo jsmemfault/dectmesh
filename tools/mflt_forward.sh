@@ -37,29 +37,30 @@ forward_cycle() {
 	pkill -f "socat.*usbmodem$PORT" 2>/dev/null; rm -f "$SOCK"; sleep 1
 	socat UNIX-LISTEN:"$SOCK",fork "$DEV",rawer & SP=$!; sleep 2
 
-	total=0
-	for f in $FILES; do
-		while :; do
-			out=$("$P9" "$SOCK" "rd:$f" 2>/dev/null)
-			serial=$(printf '%s' "$out" | sed -n 's/.*DEV:\([^:]*\):.*/\1/p' | head -1)
-			chunks=$(printf '%s' "$out" | grep -oE 'MC:[A-Za-z0-9+/=]*:')
-			[ -n "$chunks" ] && [ -n "$serial" ] || break
-			while IFS= read -r line; do
-				[ -n "$line" ] || continue
-				b64=${line#MC:}; b64=${b64%:}
-				code=$(post_chunk "$serial" "$b64")
-				case "$code" in
-					200|202) total=$((total + 1)) ;;
-					*) echo "  [$f -> $serial] chunk POST HTTP $code" ;;
-				esac
-			done <<-EOF
-			$chunks
-			EOF
-		done
-	done
-
+	# ONE p9do session, both files -- reading a file drains all its pending chunks
+	# in a single 8K read, so one read per file per cycle suffices, and a single
+	# session avoids the per-connection DTR churn that a read-loop would cause.
+	out=$("$P9" "$SOCK" rd:dev/mflt5340 rd:dev/mflt9151 2>/dev/null)
 	kill $SP 2>/dev/null; pkill -f "socat.*usbmodem$PORT" 2>/dev/null; rm -f "$SOCK"
-	echo "$(date +%T)  forwarded $total chunk(s) from [$FILES]"
+
+	# Walk the DEV:/MC: tokens in order: each DEV: sets the device the following
+	# MC: chunks belong to (self-describing streams -> one generic loop).
+	serial=""; total=0
+	for tok in $(printf '%s' "$out" | grep -oE 'DEV:[^:]*:|MC:[A-Za-z0-9+/=]+:'); do
+		case "$tok" in
+		DEV:*) serial=${tok#DEV:}; serial=${serial%:} ;;
+		MC:*)
+			[ -n "$serial" ] || continue
+			b64=${tok#MC:}; b64=${b64%:}
+			code=$(post_chunk "$serial" "$b64")
+			case "$code" in
+				200|202) total=$((total + 1)) ;;
+				*) echo "  [$serial] chunk POST HTTP $code" ;;
+			esac
+			;;
+		esac
+	done
+	echo "$(date +%T)  forwarded $total chunk(s)"
 }
 
 echo "forwarding both chips ($FILES) via $DEV -> Memfault every ${INT}s  (Ctrl-C to stop)"
