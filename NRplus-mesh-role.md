@@ -18,8 +18,9 @@ wins — only materializes if someone owns it end to end.
   and the uniform **9P filesystem control plane** that makes state, firmware, and telemetry one
   interface across transports.
 - Upstream it as first-class **Zephyr modules** and keep it building in NCS.
-- Drive the roadmap that turns the demo into something real: **link-layer security**, reliability,
-  **cloud/fleet telemetry** (nRF Cloud / Memfault), and the **sub-GHz NR+** target.
+- Drive the roadmap that turns the demo into something real: **link-layer security** (self-certifying
+  cryptographic node identity + anti-spoof proof is **already shipped**; on-air confidentiality next),
+  reliability, **cloud/fleet telemetry** (nRF Cloud / Memfault), and the **sub-GHz NR+** target.
 - Maintain a documented path toward a **certifiable MAC** as Nordic's MAC matures — so the open stack
   grows up instead of dead-ending as "research only."
 
@@ -50,15 +51,20 @@ starting time allocation (even part-time to prove it out), and explicit agreemen
 complement-the-partners posture. Scope and headcount grow with traction.
 
 ## Why me
-I've shipped the cross-PHY proof (LoRa → DECT NR+, routing unchanged) *and* the multi-hop proof: a
+I've shipped the cross-PHY proof (LoRa → DECT NR+, routing unchanged), the multi-hop proof (a
 repeatable, automated test that forces two nodes apart and verifies a real chat conversation still
-crosses via a relay. Building that test wasn't just a demo exercise — it surfaced and fixed a real
-admission-control bug (gating on the wrong address across a relay hop) and a durable-identity /
-routing-address conflation spanning two protocol layers. That's the part of the job that doesn't
-show up in a demo video: writing the test that finds the bug the demo would have quietly hidden. I
-come from **nRF Cloud** with the **Memfault** observability angle few others can bring; and I
-communicate it clearly in writing and demos — the same skill the ambassador half of the role
-demands. I'd like to point all of that at the part of Nordic where it compounds your RF strength.
+crosses via a relay), *and* — since — **self-certifying cryptographic identity**: each node's address
+is the hash of a keypair it owns, persists across power-cycles, and is provable on demand, with
+spoofing and replay rejected by an independent verifier. That last one is the tell for the *architect*
+half of this job: I recognized that a 2005 IPv6 idea (CGA), Nordic's own on-die PSA/Oberon crypto, and
+the 9P fabric compose into **self-certifying identity with no PKI** — and that *proving who you are*
+becomes just another file (`net/aether/prove`). Building the multi-hop test also wasn't a demo
+exercise — it surfaced and fixed a real admission-control bug (gating on the wrong address across a
+relay hop) and a durable-identity / routing-address conflation spanning two protocol layers: the part
+of the job that doesn't show up in a demo video — writing the test that finds the bug the demo would
+have quietly hidden. I come from **nRF Cloud** with the **Memfault** observability angle few others can
+bring; and I communicate it clearly in writing and demos — the same skill the ambassador half of the
+role demands. I'd like to point all of that at the part of Nordic where it compounds your RF strength.
 
 ---
 *Companion to the project one-pager. Built on Dean Hall's HeyMac (github.com/dwhall/HeyMac).*

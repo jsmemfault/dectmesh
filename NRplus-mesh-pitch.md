@@ -1,6 +1,6 @@
 # An open-source mesh stack for Nordic's non-cellular radios
 
-*Internal proposal — Jon Sharp, nRF Cloud · June 2026 (updated July 2026: multi-hop proven)*
+*Internal proposal — Jon Sharp, nRF Cloud · June 2026 (updated July 2026: multi-hop proven; cryptographic node identity shipped)*
 
 **One line:** Nordic ships world-class non-cellular PHYs (DECT NR+ today, sub-GHz NR+ next) but no
 open, Zephyr-native, multi-hop mesh to run on them. I've built one — a self-organizing mesh in which
@@ -62,6 +62,20 @@ per-feature protocol, no SDK per metric. Demonstrated end-to-end on hardware:
 - It's a 40-year-old idea (Plan 9) applied to embedded fleet management — and it's exactly what keeps
   the observability story below simple as the fleet grows.
 
+**Pillar 3 — cryptographic node identity, self-certifying, and *also* a file.**  *(shipped since the last update)*
+Every node's durable address is now a **Cryptographically Generated Address**: `node_eui =
+SHA256(pubkey)[:6]`, bound to a **P-256 keypair the node owns** and persists across reboots (and a full
+power-cycle — verified). Because the address *is* the hash of the key, it's **self-certifying — no PKI,
+no CA, no key distribution** — exactly what an infrastructure-less mesh needs. And a node **proves it
+owns its address** on demand: `net/aether/prove` — write a challenge, read back a signature. An
+impostor claiming another node's address, and a replayed stale proof, **both fail** — verified on
+hardware by an *independent* checker (no trust in the node). Two things worth noting: the signing runs
+on **Nordic's own PSA/Oberon crypto** (more silicon value showcased, on the stock minimal TF-M), and —
+the Plan 9 punchline — *even proving who you are is a file operation.* This is the **"link security"
+line from the roadmap below, moved to done** (identity + anti-spoof; on-air confidentiality is still
+honestly roadmap). It also quietly hardened the routing: a rebooting node reclaims its tree slot by its
+**stable key-bound identity**, so the topology re-forms to the same shape instead of churning.
+
 **The key result — cross-PHY portability.** This is a port of my proven **LoRa** mesh; the routing and
 MAC logic moved to DECT NR+ **essentially unchanged.** That's evidence the abstraction sits at the
 right layer — and it pre-fits the **sub-GHz NR+** part on the roadmap.
@@ -72,8 +86,9 @@ Code is a clean, MIT-licensed Zephyr module. 3-minute demo video (script ready �
 > network re-forms. (2) Force two nodes to refuse each other directly and watch a live chat
 > exchange still cross between them — multi-hop, proven on camera, not asserted. (3) `cat` a node's
 > live state from a laptop over BLE. (4) Update a USB-less radio's firmware by *writing a file*.
-> Self-healing, multi-hop, everything-is-a-file, and OTA-as-`cp` — on real hardware, identical
-> firmware on every node.
+> (5) **Challenge a node to prove it owns its address** — write a nonce, read a signature; then try to
+> spoof it and watch the proof fail. Self-healing, multi-hop, everything-is-a-file, OTA-as-`cp`, and
+> **cryptographic identity you can verify** — on real hardware, identical firmware on every node.
 
 ## Why this is strategic for Nordic
 - **Drives silicon adoption.** Open + easy mesh lowers the barrier to choosing a 9151 / future sub-GHz
@@ -90,15 +105,16 @@ Code is a clean, MIT-licensed Zephyr module. 3-minute demo video (script ready �
 ## Honest scope (so this complements, not competes)
 This is a **reference / research / maker enabler** that grows the top of the adoption funnel — it is
 **not** a certified product stack, and is **not** meant to displace Wirepas/Lynq, who serve certified,
-supported, high-end deployments. Custom-MAC-on-PHY can't be DECT-certified today; the roadmap (link
-security, reliability, and eventually riding a certifiable MAC as that matures) is how it grows up.
-Framing it as the open on-ramp *feeds* the partner ecosystem rather than undercutting it.
+supported, high-end deployments. Custom-MAC-on-PHY can't be DECT-certified today; the roadmap
+(**on-air confidentiality** on top of the identity/anti-spoof layer already shipped, reliability, and
+eventually riding a certifiable MAC as that matures) is how it grows up. Framing it as the open on-ramp
+*feeds* the partner ecosystem rather than undercutting it.
 
 ## What I'm proposing
 A bounded first deliverable: an **officially-sanctioned open-source NR+ PHY mesh *reference* stack in
-NCS** — the self-organizing routing layer plus the 9P fabric demonstrated above, with a cloud-telemetry
-sample wiring nodes to nRF Cloud / Memfault. From there: security, the sub-GHz NR+ target, and a
-documented path toward a certifiable MAC.
+NCS** — the self-organizing routing layer, the 9P fabric, and the **self-certifying cryptographic
+identity** demonstrated above, with a cloud-telemetry sample wiring nodes to nRF Cloud / Memfault. From
+there: on-air confidentiality, the sub-GHz NR+ target, and a documented path toward a certifiable MAC.
 
 ## The ask
 30 minutes to show the demo and find where this belongs — and who in the **DECT NR+ product line /

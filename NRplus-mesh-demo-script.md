@@ -75,7 +75,9 @@ self-heal sells "it's real," this sells "and it's a joy to work with." One termi
 | 1 | `9p ls /dev` over USB → the node tree (`fw9151`, `link9151`, `reboot9151`, …). | "The whole node is a filesystem. Live state, firmware, control — files." |
 | 2 | `9p read /dev/link9151` and `9p read /dev/fw9151` → human-readable status. | "Health and version: just read them. No SDK, no custom app." |
 | 3 | `9p write /dev/fw9151 < image` then `9p write /dev/reboot9151`; the log shows the relay **auto-confirm** the new version. | "Firmware update on a radio that has *no USB* — a file write, proxied through its companion chip. It boots, verifies, and confirms itself." |
-| 4 | (optional) the *same* `9p ls /dev` from the cyberdeck over **BLE L2CAP**. End card. | "Same filesystem, different transport — USB or Bluetooth, no code changes. That's 9P." |
+| 4 | the *same* `9p ls /dev` from the cyberdeck over **BLE L2CAP**. | "Same filesystem, different transport — USB or Bluetooth, no code changes. That's 9P." |
+| 5 | `cat net/aether/addr` → a durable address. Then `./aether_prove.sh <node>`: write a random nonce to `net/aether/prove`, read back a signature, verify → **PROOF VALID**. Re-run claiming a *different* node's address → **PROOF FAILED**. End card. | "This node's address *is* the hash of a keypair it owns — no CA, nothing to provision. Ask it to prove that: write a challenge, read a signature. It checks out. Now try to impersonate it… and the proof falls apart. Even *identity* is a file." |
 
 **Why it lands:** every beat is a generic, decades-old command doing something a microcontroller radio
-mesh has no business making this easy. No narration hype — the `ls`/`read`/`write` *is* the argument.
+mesh has no business making this easy — including *proving cryptographic identity by reading a file*.
+No narration hype — the `ls`/`read`/`write` *is* the argument.
