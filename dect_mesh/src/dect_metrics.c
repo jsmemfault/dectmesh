@@ -31,6 +31,10 @@
 
 LOG_MODULE_REGISTER(dect_metrics, LOG_LEVEL_INF);
 
+/* Collector cadence: also the divisor for the per-interval throughput rate, so
+ * the two stay in lockstep. High-resolution for the roaming field test. */
+#define METRICS_INTERVAL_S 15
+
 /* Mesh context, owned by aether_mesh.c. */
 extern struct aether_mesh_ctx *g_mesh_ctx;
 
@@ -101,6 +105,36 @@ static void metrics_collect(struct k_work *work)
 			MEMFAULT_METRIC_SET_UNSIGNED(dect_voltage, ps.last_voltage_mv);
 		}
 
+		/* Aether throughput: cumulative PHY payload bytes, plus the rate over
+		 * the last interval in bits/sec (delta*8/interval). Unsigned subtraction
+		 * is wrap-correct; skip the first sample (no baseline yet). */
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_bytes, ps.tx_bytes);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_rx_bytes, ps.rx_bytes);
+
+		static uint32_t prev_txb, prev_rxb;
+		static bool have_prev_bytes;
+
+		if (have_prev_bytes) {
+			MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_bps,
+				(uint32_t)((uint64_t)(ps.tx_bytes - prev_txb) * 8U /
+					   METRICS_INTERVAL_S));
+			MEMFAULT_METRIC_SET_UNSIGNED(dect_rx_bps,
+				(uint32_t)((uint64_t)(ps.rx_bytes - prev_rxb) * 8U /
+					   METRICS_INTERVAL_S));
+		}
+		prev_txb = ps.tx_bytes;
+		prev_rxb = ps.rx_bytes;
+		have_prev_bytes = true;
+
+		/* Pretty RF regime, decoded live from the modem's carrier + band table
+		 * (e.g. "band 4, 914.976 MHz") -- a self-explaining fleet filter axis. */
+		uint16_t car = 0;
+		char cbuf[24];
+
+		dect_phy_get_info(NULL, &car, NULL);
+		dect_phy_format_carrier(car, cbuf, sizeof(cbuf));
+		MEMFAULT_METRIC_SET_STRING(dect_carrier_decoded, cbuf);
+
 		/* Phase 2: self-organization + ARQ reliability (aephyr counters). */
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_reelections, c->reelections);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_orphans, c->orphans);
@@ -135,7 +169,7 @@ static void metrics_collect(struct k_work *work)
 	/* High-resolution cadence for the roaming field test: sample every 15 s so a
 	 * 15 s heartbeat never reports a stale snapshot (see CONFIG_MEMFAULT_METRICS_
 	 * HEARTBEAT_INTERVAL_SECS in prj.conf). */
-	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(15));
+	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(METRICS_INTERVAL_S));
 }
 static K_WORK_DELAYABLE_DEFINE(metrics_work, metrics_collect);
 #endif /* CONFIG_MEMFAULT */

@@ -52,3 +52,16 @@ MEMFAULT_METRICS_KEY_DEFINE(dect_rx_pcc, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_rx_frames, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_temp, kMemfaultMetricType_Signed)
 MEMFAULT_METRICS_KEY_DEFINE(dect_voltage, kMemfaultMetricType_Unsigned)
+
+/* Aether throughput over the mesh: cumulative PHY payload bytes (all on-air
+ * traffic this node moved, relayed frames included) + the per-interval rate in
+ * bits/sec, computed on-device from the byte delta over the 15 s collector tick
+ * -- feeds an "Aether Throughput" dashboard directly. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_tx_bytes, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rx_bytes, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_tx_bps, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rx_bps, kMemfaultMetricType_Unsigned)
+
+/* Human-readable RF regime, decoded live from the modem's carrier + band table
+ * (e.g. "band 4, 914.976 MHz") -- a pretty, self-explaining fleet filter axis. */
+MEMFAULT_METRICS_STRING_KEY_DEFINE(dect_carrier_decoded, 24)
