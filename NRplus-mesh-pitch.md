@@ -2,10 +2,12 @@
 
 *Internal proposal — Jon Sharp, nRF Cloud · June 2026 (updated July 2026: multi-hop proven; cryptographic node identity shipped)*
 
-**One line:** Nordic ships world-class non-cellular PHYs (DECT NR+ today, sub-GHz NR+ next) but no
-open, Zephyr-native, multi-hop mesh to run on them. I've built one — a self-organizing mesh in which
-**the entire distributed system is a 9P filesystem** — working across two radios, and I'd like to
-build it for Nordic as an open reference stack with fleet observability built in.
+**One line:** We ship world-class non-cellular PHYs (DECT NR+ today, sub-GHz NR+ next) but no open,
+Zephyr-native, multi-hop mesh to run on them. I built one — a self-organizing mesh in which **the
+entire distributed system is a 9P filesystem** — originally, on my own time, for a LoRa project. It
+ported to DECT NR+ essentially unchanged, and I recognized the opportunity: **it's exactly what our
+NR+ radios are missing.** I'd like to grow my personal work into an official open reference stack with
+fleet observability built in — and be a public proponent for these patterns across the Zephyr ecosystem.
 
 ---
 
@@ -119,7 +121,9 @@ there: on-air confidentiality, the sub-GHz NR+ target, and a documented path tow
 ## The ask
 30 minutes to show the demo and find where this belongs — and who in the **DECT NR+ product line /
 connectivity-software / NCS** orgs would want to own it. I want to apply my mesh + cloud experience
-where it compounds Nordic's RF strength, and I think this is that place.
+where it compounds **our** RF strength — building the stack *and* being a public proponent for these
+patterns (9P-for-embedded, self-organizing mesh, self-certifying identity) across the Zephyr ecosystem
+— and I think this is that place.
 
 ---
 *Built on Dean Hall's HeyMac (github.com/dwhall/HeyMac). Repo: github.com/jrsharp/aephyr (MIT).

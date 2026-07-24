@@ -25,7 +25,9 @@ wins — only materializes if someone owns it end to end.
   grows up instead of dead-ending as "research only."
 
 ## Mandate 2 — Developer-ecosystem voice (grow the adoption)
-Defined by adoption outcomes, not visibility for its own sake:
+Not just NR+ mesh — a **public proponent for the underlying patterns** (9P as an embedded control
+plane, self-organizing mesh, self-certifying identity) across the **Zephyr ecosystem** and the wider
+industry. Defined by adoption outcomes, not visibility for its own sake:
 - **DevAcademy course / labs** for NR+ mesh, plus reference samples that "just work" on a DK.
 - **Talks and writing** — Zephyr Developer Summit, Embedded World, Nordic webinars, DevZone.
 - An **active public repo + community**: issues, PRs, a visible roadmap people can contribute to.
@@ -56,15 +58,18 @@ repeatable, automated test that forces two nodes apart and verifies a real chat 
 crosses via a relay), *and* — since — **self-certifying cryptographic identity**: each node's address
 is the hash of a keypair it owns, persists across power-cycles, and is provable on demand, with
 spoofing and replay rejected by an independent verifier. That last one is the tell for the *architect*
-half of this job: I recognized that a 2005 IPv6 idea (CGA), Nordic's own on-die PSA/Oberon crypto, and
+half of this job: I recognized that a 2005 IPv6 idea (CGA), our own on-die PSA/Oberon crypto, and
 the 9P fabric compose into **self-certifying identity with no PKI** — and that *proving who you are*
-becomes just another file (`net/aether/prove`). Building the multi-hop test also wasn't a demo
+becomes just another file (`net/aether/prove`). The bigger version of that move came first: **I built
+Aether on my own time, for a separate LoRa project** — and recognized it was exactly the gap our NR+
+line has. Bringing my personal work across, and proving it ports essentially unchanged, is the whole
+point: seeing where a powerful thing already in hand fits a need the org hasn't filled. Building the multi-hop test also wasn't a demo
 exercise — it surfaced and fixed a real admission-control bug (gating on the wrong address across a
 relay hop) and a durable-identity / routing-address conflation spanning two protocol layers: the part
 of the job that doesn't show up in a demo video — writing the test that finds the bug the demo would
 have quietly hidden. I come from **nRF Cloud** with the **Memfault** observability angle few others can
 bring; and I communicate it clearly in writing and demos — the same skill the ambassador half of the
-role demands. I'd like to point all of that at the part of Nordic where it compounds your RF strength.
+role demands. I'd like to point all of that at the part of Nordic where it compounds our RF strength.
 
 ---
 *Companion to the project one-pager. Built on Dean Hall's HeyMac (github.com/dwhall/HeyMac).*
