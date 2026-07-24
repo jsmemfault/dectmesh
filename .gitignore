@@ -26,3 +26,4 @@ dectfw/
 *.swo
 *~
 tools/p9do
+tools/aether_verify

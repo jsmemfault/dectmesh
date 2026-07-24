@@ -39,6 +39,9 @@ LOG_MODULE_REGISTER(cga, LOG_LEVEL_INF);
 static uint8_t cga_seed[CGA_SEED_LEN];
 static bool cga_have_seed;
 
+static uint8_t cga_pub[64];      /* cached P-256 public key (X || Y) */
+static bool cga_pub_ready;
+
 /* settings loader for "cga/seed" */
 static int cga_seed_set(const char *name, size_t len,
 			settings_read_cb read_cb, void *cb_arg)
@@ -122,6 +125,8 @@ int aether_node_identity_override(uint8_t out[6])
 	if (cga_identity_pubkey(pub) < 0) {
 		return -EIO;
 	}
+	memcpy(cga_pub, pub, sizeof(cga_pub));   /* cache for the Stage-2 proof */
+	cga_pub_ready = true;
 	ocrypto_sha256(hash, pub, sizeof(pub));
 
 	memcpy(out, hash, 6);
@@ -129,4 +134,40 @@ int aether_node_identity_override(uint8_t out[6])
 	LOG_INF("CGA node identity %02x:%02x:%02x:%02x:%02x:%02x (persistent)",
 		out[0], out[1], out[2], out[3], out[4], out[5]);
 	return 0;
+}
+
+/* --- Stage 2: ownership proof over the CGA keypair -------------------------
+ * A verifier confirms this node owns its node_eui by checking
+ *   (1) SHA256(pubkey)[:6] == node_eui   (the address IS the key), and
+ *   (2) a fresh ECDSA-P256/SHA256 signature over the verifier's challenge
+ *       verifies against pubkey            (the node HOLDS the private key).
+ * These expose the two halves; the seed never leaves this module.
+ */
+int cga_get_pubkey(uint8_t pub[64])
+{
+	if (!cga_pub_ready) {
+		return -EAGAIN;
+	}
+	memcpy(pub, cga_pub, 64);
+	return 0;
+}
+
+int cga_sign(const uint8_t *msg, size_t len, uint8_t sig[64])
+{
+	uint8_t ek[32];
+
+	if (!cga_have_seed) {
+		return -EAGAIN;
+	}
+	/* ECDSA needs a fresh, valid per-signature nonce ek -- reusing one leaks
+	 * the private key. Draw a new random ek and retry until it is in range. */
+	for (int tries = 0; tries < 8; tries++) {
+		if (psa_generate_random(ek, sizeof(ek)) != PSA_SUCCESS) {
+			return -EIO;
+		}
+		if (ocrypto_ecdsa_p256_sign(sig, msg, len, cga_seed, ek) == 0) {
+			return 0;
+		}
+	}
+	return -EIO;
 }

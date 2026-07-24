@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include "cga.h"   /* cga_get_pubkey / cga_sign for net/aether/prove */
 
 /* A best-effort broadcast is one-shot at the mesh layer, so a transient busy
  * channel (LBT -EBUSY) would surface to the client as a send failure. Absorb it
@@ -74,6 +75,7 @@ enum conv_state { CONV_UNCONNECTED = 0, CONV_CONNECTED, CONV_ANNOUNCED, CONV_BCA
 enum anode_kind {
 	K_ROOT = 0, K_CLONE, K_TOPSTATUS, K_ADDR, K_STATS, K_MAXMSG,
 	K_CONVDIR, K_CTL, K_DATA, K_LOCAL, K_REMOTE, K_CSTATUS,
+	K_PROVE,
 };
 
 struct anode {
@@ -100,8 +102,14 @@ struct aether_net_fs {
 	uint8_t myaddr[6];
 	uint32_t next_qid;
 
-	struct ninep_fs_node root, clone, topstatus, addr, statf, maxmsgf;
-	struct anode an_root, an_clone, an_topstatus, an_addr, an_statf, an_maxmsgf;
+	struct ninep_fs_node root, clone, topstatus, addr, statf, maxmsgf, provef;
+	struct anode an_root, an_clone, an_topstatus, an_addr, an_statf, an_maxmsgf, an_provef;
+
+	/* Stage-2 CGA ownership proof: hex-encoded "pubkey signature" generated when
+	 * a challenge is written to net/aether/prove (signed at write, served at
+	 * read). Empty until the first challenge. */
+	uint8_t prove_out[264];
+	uint16_t prove_out_len;
 
 	/* stats(5)-style datagram counters, surfaced at /net/aether/stats. Each
 	 * field is touched from one context (tx_* from the writer thread, rx_*
@@ -492,6 +500,18 @@ static int anet_read(struct ninep_fs_node *node, uint64_t offset, uint8_t *buf,
 		 * negotiate msize <= it. One DECT frame today (no fragmentation). */
 		n = snprintf(s, sizeof(s), "%d\n", AETHER_MAX_MSG);
 		break;
+	case K_PROVE: {
+		/* Serve the "pubkey signature" hex proof generated when the challenge
+		 * was written (offset-addressable). Empty until a nonce is written. */
+		if (offset >= (uint64_t)g_fs.prove_out_len) {
+			return 0;
+		}
+		uint32_t avail = g_fs.prove_out_len - (uint32_t)offset;
+		uint32_t k = MIN(count, avail);
+
+		memcpy(buf, g_fs.prove_out + offset, k);
+		return (int)k;
+	}
 	case K_CLONE:
 	case K_CTL:
 		n = snprintf(s, sizeof(s), "%d\n", c ? c->slot : 0);
@@ -595,6 +615,42 @@ static int anet_write(struct ninep_fs_node *node, uint64_t offset, const uint8_t
 		int ret = c ? ctl_exec(c, cmd) : -EINVAL;
 		k_mutex_unlock(&g_fs.lock);
 		return ret < 0 ? ret : (int)count;
+	}
+
+	if (an->kind == K_PROVE) {
+		/* Stage-2 ownership proof: the written bytes are the verifier's
+		 * challenge. Sign them with this node's CGA private key NOW and cache
+		 * "pubkey_hex signature_hex" for the following read. A fresh signature
+		 * over a caller-chosen nonce proves live key possession (not a replay);
+		 * pairing it with pubkey lets the verifier also check
+		 * node_eui == SHA256(pubkey)[:6]. */
+		static const char hexd[] = "0123456789abcdef";
+		uint8_t nonce[32], pub[64], sig[64];
+		uint32_t nlen = MIN(count, sizeof(nonce));
+
+		memcpy(nonce, buf, nlen);
+		if (cga_get_pubkey(pub) < 0 || cga_sign(nonce, nlen, sig) < 0) {
+			k_mutex_lock(&g_fs.lock, K_FOREVER);
+			g_fs.prove_out_len = 0;
+			k_mutex_unlock(&g_fs.lock);
+			return -EIO;
+		}
+		k_mutex_lock(&g_fs.lock, K_FOREVER);
+		int p = 0;
+
+		for (int i = 0; i < 64; i++) {
+			g_fs.prove_out[p++] = hexd[pub[i] >> 4];
+			g_fs.prove_out[p++] = hexd[pub[i] & 0x0f];
+		}
+		g_fs.prove_out[p++] = ' ';
+		for (int i = 0; i < 64; i++) {
+			g_fs.prove_out[p++] = hexd[sig[i] >> 4];
+			g_fs.prove_out[p++] = hexd[sig[i] & 0x0f];
+		}
+		g_fs.prove_out[p++] = '\n';
+		g_fs.prove_out_len = (uint16_t)p;
+		k_mutex_unlock(&g_fs.lock);
+		return (int)count;
 	}
 
 	if (an->kind == K_DATA) {
@@ -750,11 +806,13 @@ int aether_net_init(struct net_if *iface, const uint8_t myaddr[6])
 	node_init(&g_fs.addr, "addr", NINEP_NODE_FILE, &g_fs.an_addr, K_ADDR, NULL);
 	node_init(&g_fs.statf, "stats", NINEP_NODE_FILE, &g_fs.an_statf, K_STATS, NULL);
 	node_init(&g_fs.maxmsgf, "maxmsg", NINEP_NODE_FILE, &g_fs.an_maxmsgf, K_MAXMSG, NULL);
+	node_init(&g_fs.provef, "prove", NINEP_NODE_FILE, &g_fs.an_provef, K_PROVE, NULL);
 	link_child(&g_fs.root, &g_fs.clone);
 	link_child(&g_fs.root, &g_fs.topstatus);
 	link_child(&g_fs.root, &g_fs.addr);
 	link_child(&g_fs.root, &g_fs.statf);
 	link_child(&g_fs.root, &g_fs.maxmsgf);
+	link_child(&g_fs.root, &g_fs.provef);
 
 	int ret = aether_mesh_register_recv_callback(iface, aether_recv_cb, NULL);
 
