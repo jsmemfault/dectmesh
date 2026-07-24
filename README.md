@@ -40,6 +40,9 @@ nRF9151 · “DECTstrous Mesh” · 9P SERVER (in-process with the mesh)
    └─ DECT NR+ PHY radio  )))  ─────▶  other DECTstrous nodes
 ```
 
+> **The full picture** — firmware per chip/core (5340 app + net, 9151 app + modem), the
+> software stack, and every transport — is diagrammed in [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md).
+
 ## Why 9P? (this is the multiplier)
 
 Everything above is a **file** in a 9P namespace — not as a metaphor, but literally:
@@ -212,6 +215,7 @@ against the claimed address **and** the ECDSA-P256 signature. An impostor presen
 | **`dect_mesh/`** | nRF9151 app (*DECTstrous Mesh*): Æther/HONR mesh on the DECT NR+ PHY + the `/net/aether` & `/dev/firmware` 9P server + Memfault |
 | **`dect_relay/`** | nRF5340 app (*DECTstrous Relay*): the 9P aggregator — USB-CDC 9P server, 9P client to the 9151, OTA/self-heal/auto-confirm, shell |
 | **`flash-thingy.sh`** | One-time J-Link bring-up of a new node (`relay` / `mesh`); after this, nodes update over USB/OTA |
+| **`doc/ARCHITECTURE.md`** | **The moving parts** — system diagram, firmware per chip/core (5340 + 9151 + modem), the software stack, and transports |
 | **`doc/OTA.md`** | **Firmware OTA over 9P** — the headline "update = a file write" capability: value prop, the plain-`9p write` recipe (the relay rate-matches the inter-chip UART), verification, and gotchas |
 | **`doc/NET_AETHER_SPEC.md`** | The `/net/aether` datagram-service spec (Plan 9 `/net`-style clone/ctl/data) |
 | **`doc/PROOF.md`** | Proof dossier — the on-hardware transcripts behind every claim (multi-hop, CGA persistence, ownership proof + spoof rejection) |
