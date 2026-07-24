@@ -35,6 +35,7 @@ assoc=$(curl -s -u ":$OAT" -X POST "$API/symbols" \
 	-H "Content-Type: application/json" \
 	-d "{\"file\":{\"token\":\"$tok\"},\"software_version\":{\"version\":\"$VER\",\"software_type\":\"$TYPE\"}}")
 case "$assoc" in
+	*'already exists'*) echo "  symbols already present for this type+version (OK)" ;;
 	*'"error"'*) echo "  associate FAILED: $assoc"; exit 1 ;;
 	*) echo "  symbols associated OK" ;;
 esac
