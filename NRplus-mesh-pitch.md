@@ -109,8 +109,12 @@ This is a **reference / research / maker enabler** that grows the top of the ado
 **not** a certified product stack, and is **not** meant to displace Wirepas/Lynq, who serve certified,
 supported, high-end deployments. Custom-MAC-on-PHY can't be DECT-certified today; the roadmap
 (**on-air confidentiality** on top of the identity/anti-spoof layer already shipped, reliability, and
-eventually riding a certifiable MAC as that matures) is how it grows up. Framing it as the open on-ramp
-*feeds* the partner ecosystem rather than undercutting it.
+eventually riding a certifiable MAC as that matures) is how it grows up. The near-term regulatory rigor
+is mine to run now — characterizing the real **on-air behavior (duty cycle, occupied bandwidth,
+spectral properties) with my own SDR** — and I'd want to **partner with our RF-certification
+specialists** to chart the path from an R&D-band experiment toward something certifiable: I don't come
+as an RF-cert expert, I come to learn that process from ours and hand them a concrete stack worth taking
+through it. Framing it as the open on-ramp *feeds* the partner ecosystem rather than undercutting it.
 
 ## What I'm proposing
 A bounded first deliverable: an **officially-sanctioned open-source NR+ PHY mesh *reference* stack in

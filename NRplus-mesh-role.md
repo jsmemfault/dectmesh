@@ -23,6 +23,12 @@ wins — only materializes if someone owns it end to end.
   reliability, **cloud/fleet telemetry** (nRF Cloud / Memfault), and the **sub-GHz NR+** target.
 - Maintain a documented path toward a **certifiable MAC** as Nordic's MAC matures — so the open stack
   grows up instead of dead-ending as "research only."
+- **Chart the regulatory path with our RF experts.** Characterize the real on-air behavior — duty
+  cycle, occupied bandwidth, spectral mask — with SDR (my near-term step, already my plan), and
+  **partner with, and help coordinate, our RF-certification specialists** to take it from an R&D-band
+  experiment toward a certifiable product. I don't arrive as an RF-cert expert; I arrive to learn that
+  process from ours and give them a concrete artifact worth certifying — the kind of cross-functional
+  glue this project needs to become real.
 
 ## Mandate 2 — Developer-ecosystem voice (grow the adoption)
 Not just NR+ mesh — a **public proponent for the underlying patterns** (9P as an embedded control
@@ -48,9 +54,10 @@ industry. Defined by adoption outcomes, not visibility for its own sake:
 4. A working **mesh-to-cloud** telemetry sample (nodes → nRF Cloud / Memfault) — the differentiator.
 
 ## What I'd need
-An exec sponsor spanning **DevRel / ecosystem + connectivity-SW / product**, a home org, a clear
-starting time allocation (even part-time to prove it out), and explicit agreement on the open-source +
-complement-the-partners posture. Scope and headcount grow with traction.
+An exec sponsor spanning **DevRel / ecosystem + connectivity-SW / product** (and a line into the
+**RF / regulatory-certification** function), a home org, a clear starting time allocation (even
+part-time to prove it out), and explicit agreement on the open-source + complement-the-partners
+posture. Scope and headcount grow with traction.
 
 ## Why me
 I've shipped the cross-PHY proof (LoRa → DECT NR+, routing unchanged), the multi-hop proof (a
