@@ -3,8 +3,8 @@
 A self-organizing, self-healing multi-hop radio mesh on Nordic **nRF9151**, built
 directly on the **DECT NR+ physical layer** (ETSI TS 103 636-2) — and wrapped so
 that its **entire control surface is a 9P filesystem**: live mesh state, firmware,
-link health, and control are all just *files* you read and write with generic,
-decades-old tooling, over USB / BLE / UART / TCP / or across the mesh itself.
+link health, **cryptographic identity**, and control are all just *files* you read and
+write with generic, decades-old tooling, over USB / BLE / UART / TCP / or across the mesh itself.
 
 Two chips on a Thingy:91 X, two apps:
 
@@ -31,9 +31,9 @@ nRF5340 · “DECTstrous Relay” · 9P AGGREGATOR (server to host ⇄ client to
                         │  9P over UART
                         ▼
 nRF9151 · “DECTstrous Mesh” · 9P SERVER (in-process with the mesh)
-   ├─ /net/aether    datagram service: clone → per-conversation ctl/data
-   │                 (Plan 9 /net-style; doc/NET_AETHER_SPEC.md) — proxied to
-   │                 the host by the relay via remote_fs
+   ├─ /net/aether    datagram service + identity: clone → per-conversation ctl/data,
+   │                 addr (self-certifying CGA) · prove (sign a challenge to own it)
+   │                 (Plan 9 /net-style; doc/NET_AETHER_SPEC.md) — proxied to the host
    ├─ /dev/aether    node state: addr · rank · tree · neighbors · routes · chat
    ├─ /dev/firmware  its own MCUboot DFU  (re-exported by the relay as /dev/fw9151)
    ├─ Æther / HONR self-organizing, self-healing routing
@@ -185,6 +185,26 @@ It validates the full path: `clone` allocates conversation N, holding the ctl fi
 (`status` reports `1/4`), the deep walk to `N/data` succeeds, a `connect` ctl command + a datagram
 `write` go out over the DECT mesh, and clunking ctl tears the conversation down cleanly (`0/4`).
 
+### Proving a node owns its address (`net/aether/prove`)
+
+A node's durable address is a **Cryptographically Generated Address**: `node_eui = SHA256(pubkey)[:6]`,
+bound to a P-256 key the node generates once and persists in NVS. It's **self-certifying** — to trust
+that an address belongs to a key, you hash the key; no PKI, no CA. And proving it is, of course, a file:
+write a challenge to `net/aether/prove`, read back the node's public key and a signature over your nonce.
+
+```sh
+cc -O2 -o tools/aether_verify tools/aether_verify.c \
+   -I$(brew --prefix openssl@3)/include -L$(brew --prefix openssl@3)/lib -lcrypto
+tools/aether_prove.sh 1303        # write a nonce → read pubkey+signature → verify independently
+# → address binding: MATCH · key possession: VALID · ✓ PROOF VALID
+```
+
+The verifier (`tools/aether_verify.c`) trusts nothing the node says — it checks `SHA256(pubkey)[:6]`
+against the claimed address **and** the ECDSA-P256 signature. An impostor presenting a valid proof under
+*another* node's address fails the binding; a replayed signature fails the challenge. Signing runs on the
+9151's on-die **PSA/Oberon** crypto. Full transcripts (multi-hop, identity persistence, spoof rejection):
+**[`doc/PROOF.md`](doc/PROOF.md)**.
+
 ## Layout
 
 | Path | What |
@@ -194,9 +214,10 @@ It validates the full path: `clone` allocates conversation N, holding the ctl fi
 | **`flash-thingy.sh`** | One-time J-Link bring-up of a new node (`relay` / `mesh`); after this, nodes update over USB/OTA |
 | **`doc/OTA.md`** | **Firmware OTA over 9P** — the headline "update = a file write" capability: value prop, the plain-`9p write` recipe (the relay rate-matches the inter-chip UART), verification, and gotchas |
 | **`doc/NET_AETHER_SPEC.md`** | The `/net/aether` datagram-service spec (Plan 9 `/net`-style clone/ctl/data) |
+| **`doc/PROOF.md`** | Proof dossier — the on-hardware transcripts behind every claim (multi-hop, CGA persistence, ownership proof + spoof rejection) |
+| **`tools/`** | Host-side 9P clients, proof/test scripts, and the native chat client (`tools/README.md`) |
 | **`dectfw/`** | Licensed DECT NR+ PHY modem firmware (access-gated — **never commit**) |
-| **`legacy_flood/`** | The original flood+TTL Memfault example, superseded by `dect_mesh` |
-| **`NRplus-mesh-*.md`** | Pitch / role / demo-script docs |
+| **`NRplus-mesh-*.md`** | Pitch / role / demo-script — the project one-pager and how I'd lead it |
 
 Both apps consume two out-of-tree Zephyr modules: **aephyr** (the Æther/HeyMac/HONR mesh
 stack + DECT NR+ PHY driver) and **9p4z** (the 9P library: UART, USB, BLE L2CAP, TCP).

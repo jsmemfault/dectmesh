@@ -1,22 +1,20 @@
-# Build output (build/, build_thingy/, build-*/ — at any depth)
+# Build output (build/, build_thingy/, build_dk/, build-*/ — at any depth)
 build/
 build-*/
 build_*/
 
-# Compiled host tools (the source is committed, the binary is not)
+# Compiled host tools (sources are committed, binaries are not)
 tools/aether_conv
 tools/aether_test
+tools/aether_verify
+tools/p9do
 
-# Licensed Nordic DECT NR+ modem firmware — NEVER commit (per license agreement)
+# Licensed Nordic DECT NR+ PHY modem firmware — NEVER commit (per license agreement)
 dectfw/
 
 # Session logs / scratch
 *.log
 *.exit
-
-# Python / tooling
-*.pyc
-.venv/
 
 # Local editor / agent config
 .claude/
@@ -25,5 +23,3 @@ dectfw/
 *.swp
 *.swo
 *~
-tools/p9do
-tools/aether_verify
