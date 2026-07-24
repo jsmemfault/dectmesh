@@ -13,7 +13,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/aether_mesh.h>
+#include <zephyr/net/heymac.h>
 #include <zephyr/net/honr.h>
+#include <zephyr/net/net_if.h>
 #include <stdio.h>
 
 #if defined(CONFIG_MEMFAULT)
@@ -58,6 +60,23 @@ static void metrics_collect(struct k_work *work)
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_hello_recv, c->hello_received);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_forwarded, c->packets_forwarded);
 		MEMFAULT_METRIC_SET_UNSIGNED(dect_dropped, c->packets_dropped);
+
+#if defined(CONFIG_AETHER_ROUTING_HONR)
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_is_root, honr_is_root(c->honr_addr) ? 1U : 0U);
+#endif
+		/* Link health from the HeyMac L2 context (last-frame RSSI/SNR + error
+		 * counters) -- available today, no aephyr changes. */
+		struct heymac_context *hc = c->iface ? net_if_l2_data(c->iface) : NULL;
+
+		if (hc) {
+			MEMFAULT_METRIC_SET_SIGNED(dect_rssi, hc->last_rx_rssi);
+			MEMFAULT_METRIC_SET_SIGNED(dect_snr, hc->last_rx_snr);
+			MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_err, hc->tx_errors);
+			MEMFAULT_METRIC_SET_UNSIGNED(dect_rx_err, hc->rx_errors);
+		}
+		/* RF regime (build config) -- fleet filter axes. */
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_carrier, CONFIG_AETHER_DECT_CARRIER);
+		MEMFAULT_METRIC_SET_UNSIGNED(dect_tx_power, CONFIG_AETHER_DECT_TX_POWER);
 	}
 	k_work_reschedule(k_work_delayable_from_work(work), K_SECONDS(30));
 }
@@ -68,11 +87,22 @@ void dect_metrics_init(void)
 {
 #if defined(CONFIG_MEMFAULT) && defined(CONFIG_MEMFAULT_NCS_DEVICE_ID_RUNTIME)
 	char id[24];
-	int len = snprintf(id, sizeof(id), "dect-mesh-%08x", aether_honr_node_id());
+	int len;
 
+	/* Identity = the CGA (node_eui): the self-certifying address IS the device's
+	 * name in the fleet, so a reviewer filters Memfault by cryptographic identity.
+	 * Fall back to the hardware node id if the mesh isn't up yet. */
+	if (g_mesh_ctx) {
+		const uint8_t *e = g_mesh_ctx->node_eui;
+
+		len = snprintf(id, sizeof(id), "dect-%02x%02x%02x%02x%02x%02x",
+			       e[0], e[1], e[2], e[3], e[4], e[5]);
+	} else {
+		len = snprintf(id, sizeof(id), "dect-mesh-%08x", aether_honr_node_id());
+	}
 	if (len > 0 && len < (int)sizeof(id) &&
 	    memfault_ncs_device_id_set(id, len) == 0) {
-		LOG_INF("Memfault device ID: %s", id);
+		LOG_INF("Memfault device ID (CGA): %s", id);
 	}
 #endif
 #if defined(CONFIG_MEMFAULT)

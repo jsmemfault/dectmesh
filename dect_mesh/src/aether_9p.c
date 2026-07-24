@@ -28,6 +28,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#if defined(CONFIG_MEMFAULT)
+#include <memfault/core/data_packetizer.h>
+#endif
 
 LOG_MODULE_REGISTER(aether_9p, LOG_LEVEL_INF);
 
@@ -363,6 +366,61 @@ static int register_dev(void)
 	return 0;
 }
 
+#if defined(CONFIG_MEMFAULT)
+/* Base64-encode n bytes of `in` into `out` (no NUL); returns bytes written. */
+static int b64enc(const uint8_t *in, size_t n, char *out)
+{
+	static const char t[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	int o = 0;
+
+	for (size_t i = 0; i < n; i += 3) {
+		uint32_t v = (uint32_t)in[i] << 16 |
+			     (uint32_t)(i + 1 < n ? in[i + 1] : 0) << 8 |
+			     (uint32_t)(i + 2 < n ? in[i + 2] : 0);
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		out[o++] = (i + 1 < n) ? t[(v >> 6) & 63] : '=';
+		out[o++] = (i + 2 < n) ? t[v & 63] : '=';
+	}
+	return o;
+}
+
+/*
+ * dev/mflt -- drain pending Memfault chunks as base64 "MC:<b64>:" lines (the
+ * standard chunk-export wire format). Reading the file consumes chunks; a host
+ * or gateway forwarder (tools/mflt_forward.sh) reads it over 9P and POSTs each
+ * chunk to Memfault. Observability rides the same filesystem as everything else
+ * -- no separate telemetry protocol, and it works over UART / USB / BLE / mesh.
+ */
+static int gen_mflt(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (offset) {
+		return 0;   /* one drain per read op (fresh reads have offset 0) */
+	}
+	int total = 0;
+	uint8_t chunk[192];
+
+	while (memfault_packetizer_data_available()) {
+		/* get_chunk is destructive, so ensure the encoded line fits first:
+		 * "MC:" + ceil(n/3)*4 + ":\n" for n<=192 is <= 264 bytes. */
+		if (total + 270 > (int)buf_size) {
+			break;
+		}
+		size_t clen = sizeof(chunk);
+
+		if (!memfault_packetizer_get_chunk(chunk, &clen)) {
+			break;
+		}
+		buf[total++] = 'M'; buf[total++] = 'C'; buf[total++] = ':';
+		total += b64enc(chunk, clen, (char *)buf + total);
+		buf[total++] = ':'; buf[total++] = '\n';
+	}
+	return total;
+}
+#endif /* CONFIG_MEMFAULT */
+
 /*
  * Node-state files under /dev/aether (spec §10: node state -- addr/rank/tree/
  * neighbors/routes/chat -- is distinct from the /net/aether *network* datagram
@@ -384,6 +442,10 @@ static int register_dev_aether(void)
 	ninep_sysfs_register_file(&sysfs, "dev/aether/neighbors", gen_neighbors, NULL);
 	ninep_sysfs_register_file(&sysfs, "dev/aether/routes", gen_routes, NULL);
 	ninep_sysfs_register_writable_file(&sysfs, "dev/aether/chat", gen_chat, write_chat, NULL);
+#if defined(CONFIG_MEMFAULT)
+	/* Memfault chunk export as a file -- read to drain, forward to the cloud. */
+	ninep_sysfs_register_file(&sysfs, "dev/mflt", gen_mflt, NULL);
+#endif
 	return 0;
 }
 

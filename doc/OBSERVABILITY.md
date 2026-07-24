@@ -148,16 +148,18 @@ refreshed from real devices — exactly the "log in and see it" experience.
 
 ## Phasing (honest status)
 
-- **Today:** device ID + 8 heartbeat metrics (`dect_metrics.c`, 30 s collector) — topology
-  + traffic counters. Collected on-device; **not yet uploaded** (`MEMFAULT_NCS_PROJECT_KEY`
-  is empty and there's no forwarder yet).
-- **Phase 1 (this spec):** harvest the *already-available* data — RSSI/SNR, tx/rx errors,
-  `is_root` — and add device attributes (CGA, band, version, role). No aephyr changes.
-- **Phase 2:** add the `new` counters (reelections, ARQ retx/failed, rxq drops, LBT,
-  airtime) in aephyr + the driver; add the trace events.
-- **Phase 3 (the pipeline):** the `/dev/mflt` 9P chunk file + `tools/mflt_forward.sh`
-  host forwarder + a set project key → **real data in Memfault.** Then build the
-  dashboard above and share the fleet view.
+- **Phase 1 — DONE (built, `dect_metrics.c` + heartbeat def):** the device serial is now
+  the **CGA** (`dect-<node_eui>` — cryptographic identity = fleet device name), plus the
+  harvested metrics — `dect_is_root`, `dect_rssi`, `dect_snr`, `dect_tx_err`, `dect_rx_err`,
+  `dect_carrier`, `dect_tx_power` — on top of the original 8. No aephyr changes.
+- **Pipeline — DONE (built):** `dev/mflt` is a 9P file (`aether_9p.c`) that drains Memfault
+  chunks as `MC:<base64>:` lines; `tools/mflt_forward.sh` reads it over 9P and POSTs each
+  chunk to the Memfault chunks API (device serial = the CGA).
+- **To go live (needs your input):** set `CONFIG_MEMFAULT_NCS_PROJECT_KEY` (or pass the key
+  to the forwarder), OTA the 0.7.39 image, and run `MEMFAULT_PROJECT_KEY=… mflt_forward.sh
+  <9P port>` → **real data in Memfault.** Then build the dashboard above.
+- **Phase 2 (next):** the `new` counters (reelections, ARQ retx/failed, rxq drops, LBT,
+  airtime) in aephyr + the driver, and the discrete trace events.
 
 ## References
 `../dect_mesh/src/dect_metrics.c`, `../dect_mesh/config/memfault_metrics_heartbeat_config.def`,

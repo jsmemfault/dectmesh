@@ -24,6 +24,12 @@ top-level `README.md` for the bridge pattern). C tools are single-file; build wi
 | `aether_chat_test.sh` | End-to-end party-line chat test across the full host→relay→9151 path. |
 | `rel_sweep.sh` | Characterizes reliable-datagram delivery under load. |
 
+## Observability
+
+| Tool | What it does |
+|------|--------------|
+| `mflt_forward.sh` | Reads a node's Memfault chunks from the `dev/mflt` 9P file and POSTs them to the Memfault cloud (device serial = the node's CGA). The bench stand-in for a field gateway. `MEMFAULT_PROJECT_KEY=<key> mflt_forward.sh <9P port> [interval]`. See `doc/OBSERVABILITY.md`. |
+
 ## Native chat client — `achat/`
 
 A native plan9port Aether chat client (opens the USB-CDC port directly via

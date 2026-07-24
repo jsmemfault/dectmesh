@@ -17,3 +17,16 @@ MEMFAULT_METRICS_KEY_DEFINE(dect_hello_sent, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_hello_recv, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_forwarded, kMemfaultMetricType_Unsigned)
 MEMFAULT_METRICS_KEY_DEFINE(dect_dropped, kMemfaultMetricType_Unsigned)
+
+/* Phase 1: node role + link health, harvested from HONR + the HeyMac L2 context.
+ * These back the self-organization ("is_root", exactly one per partition) and
+ * PHY-aware ("rssi/snr", "tx/rx errors") claims without any aephyr changes. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_is_root, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rssi, kMemfaultMetricType_Signed)
+MEMFAULT_METRICS_KEY_DEFINE(dect_snr, kMemfaultMetricType_Signed)
+MEMFAULT_METRICS_KEY_DEFINE(dect_tx_err, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_rx_err, kMemfaultMetricType_Unsigned)
+
+/* RF regime (build config) — group/filter the fleet by band, carrier, power. */
+MEMFAULT_METRICS_KEY_DEFINE(dect_carrier, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dect_tx_power, kMemfaultMetricType_Unsigned)
