@@ -375,11 +375,24 @@ static int do_mesh_ota(const char *eui, const char *file, int chunk)
 	const char *pace_s = getenv("MESH_OTA_PACE_US");
 	int pace_us = pace_s ? atoi(pace_s) : 60000;   /* settle between mesh writes */
 
-	while ((r = fread(blk, 1, chunk, f)) > 0) {
-		int w = do_pwrite(1, off, blk, (int)r);
+	int retries = 0;
 
+	while ((r = fread(blk, 1, chunk, f)) > 0) {
+		/* A failed dev/push write means the gateway's mesh Twrite to the peer was
+		 * never delivered (sr<0) -- the peer did NOT process it -- so re-sending the
+		 * SAME chunk at the SAME offset is safe. Retry generously: the peer is only
+		 * transiently busy (finishing its previous reliable reply). This is the
+		 * host-side equivalent of the firmware sender-retry, so it works even when
+		 * the gateway lacks it. */
+		int w = -1;
+
+		for (int attempt = 0; attempt < 15 && w < 0; attempt++) {
+			if (attempt > 0) { retries++; usleep(150000); }
+			w = do_pwrite(1, off, blk, (int)r);
+		}
 		if (w < 0) {
-			fprintf(stderr, "\nwrite failed at offset %llu\n", (unsigned long long)off);
+			fprintf(stderr, "\nwrite failed at offset %llu (gave up)\n",
+				(unsigned long long)off);
 			free(blk); fclose(f); do_clunk(1); return 1;
 		}
 		off += w;
@@ -390,7 +403,8 @@ static int do_mesh_ota(const char *eui, const char *file, int chunk)
 			fflush(stdout);
 		}
 	}
-	printf("\r[ok] streamed %llu B in %ld ms\n", (unsigned long long)off, now_ms() - t0);
+	printf("\r[ok] streamed %llu B in %ld ms (%d write-retries)\n",
+	       (unsigned long long)off, now_ms() - t0, retries);
 	free(blk); fclose(f);
 	do_clunk(1);
 
