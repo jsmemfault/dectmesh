@@ -75,6 +75,7 @@ static int fd = -1;
 static uint8_t mbuf[MSIZE];
 static char lerr[128];
 static volatile sig_atomic_t g_stop = 0;
+static char g_where[80] = "?";   /* diagnostic: what op last hit a transport error */
 
 /* ---- config ---- */
 static const char *g_dev_arg;      /* suffix or full path as given */
@@ -196,13 +197,15 @@ static int readn_to(uint8_t *b, int n, int timeout_ms)
 static int rpc_to(int len, int timeout_ms)
 {
 	p32(mbuf, len);
-	if (write(fd, mbuf, len) != len) return RC_ERR;
+	if (write(fd, mbuf, len) != len) { snprintf(g_where, sizeof(g_where), "write"); return RC_ERR; }
 	uint8_t hdr[4];
 	int r = readn_to(hdr, 4, timeout_ms);
+	if (r == RC_ERR) { snprintf(g_where, sizeof(g_where), "readhdr-eof"); return RC_ERR; }
 	if (r < 0) return r;
 	uint32_t sz = g32(hdr);
-	if (sz < 7 || sz > MSIZE) return RC_ERR;
+	if (sz < 7 || sz > MSIZE) { snprintf(g_where, sizeof(g_where), "badsize=%u", sz); return RC_ERR; }
 	r = readn_to(mbuf, sz - 4, timeout_ms);
+	if (r == RC_ERR) { snprintf(g_where, sizeof(g_where), "readbody-eof"); return RC_ERR; }
 	if (r < 0) return r;
 	int type = mbuf[0];
 	if (type == Rerror) {
@@ -363,6 +366,7 @@ static void mesh_close(void)
  * at the mesh layer). Returns reply length, or <=0 on failure. */
 static int mesh_rpc(int len)
 {
+	p32(pbuf, (uint32_t)len);   /* stamp the peer 9P size prefix (we build these) */
 	uint16_t want = (uint16_t)(pbuf[5] | (pbuf[6] << 8));
 	for (int attempt = 0; attempt < 4; attempt++) {
 		if (do_write_fid(FID_DATA, pbuf, len) < 0) return -1;
@@ -386,7 +390,8 @@ static int peer_version(void)
 	p32(pbuf + o, 512); o += 4;
 	p16(pbuf + o, 6); o += 2; memcpy(pbuf + o, "9P2000", 6); o += 6;
 	int r = mesh_rpc(o);
-	return (r > 0 && rbuf[0] == Rversion) ? 0 : -1;
+	/* reply is a FRAMED datagram (size[4] kept): type@4, tag@5, count@7, data@11. */
+	return (r > 4 && rbuf[4] == Rversion) ? 0 : -1;
 }
 
 static int peer_attach(uint32_t fid_)
@@ -397,7 +402,7 @@ static int peer_attach(uint32_t fid_)
 	p16(pbuf + o, 1); o += 2; pbuf[o++] = 't';
 	p16(pbuf + o, 0); o += 2;
 	int r = mesh_rpc(o);
-	return (r > 0 && rbuf[0] == Rattach) ? 0 : -1;
+	return (r > 4 && rbuf[4] == Rattach) ? 0 : -1;
 }
 
 static int peer_walk(uint32_t fid_, uint32_t newfid, const char *name)
@@ -410,7 +415,7 @@ static int peer_walk(uint32_t fid_, uint32_t newfid, const char *name)
 	int l = strlen(name);
 	p16(pbuf + o, l); o += 2; memcpy(pbuf + o, name, l); o += l;
 	int r = mesh_rpc(o);
-	return (r > 0 && rbuf[0] == Rwalk) ? 0 : -1;
+	return (r > 4 && rbuf[4] == Rwalk) ? 0 : -1;
 }
 
 static int peer_open(uint32_t fid_, uint8_t mode)
@@ -419,7 +424,7 @@ static int peer_open(uint32_t fid_, uint8_t mode)
 	pbuf[o++] = Topen; p16(pbuf + o, g_ptag++); o += 2;
 	p32(pbuf + o, fid_); o += 4; pbuf[o++] = mode;
 	int r = mesh_rpc(o);
-	return (r > 0 && rbuf[0] == Ropen) ? 0 : -1;
+	return (r > 4 && rbuf[4] == Ropen) ? 0 : -1;
 }
 
 static int peer_read(uint32_t fid_, uint64_t off, char *out, int cap)
@@ -430,10 +435,11 @@ static int peer_read(uint32_t fid_, uint64_t off, char *out, int cap)
 	p32(pbuf + o, off); o += 4; p32(pbuf + o, off >> 32); o += 4;
 	p32(pbuf + o, cap > 400 ? 400 : cap); o += 4;
 	int r = mesh_rpc(o);
-	if (r <= 0 || rbuf[0] != Rread) return -1;
-	uint32_t n = g32(rbuf + 3);
+	if (r <= 4 || rbuf[4] != Rread) return -1;
+	uint32_t n = g32(rbuf + 7);           /* Rread count, past size[4]+type[1]+tag[2] */
 	if ((int)n > cap) n = cap;
-	memcpy(out, rbuf + 7, n);
+	if ((int)n > r - 11) n = r - 11;      /* guard against a short datagram */
+	memcpy(out, rbuf + 11, n);            /* data starts past count[4] */
 	return n;
 }
 
@@ -445,11 +451,14 @@ static int read_peer_mflt(const char *cga, char *out, int cap)
 	long deadline = now_ms() + 20000;
 	int rc = mesh_connect(cga);
 	if (rc == RC_ERR) return RC_ERR;
-	if (rc != 0) { return 0; }          /* connect refused: peer unreachable now */
+	if (rc != 0) { logline("    peer %s: connect failed", cga); return 0; }
 	int total = 0;
-	if (peer_version() != 0 || peer_attach(FID_ROOT) != 0 ||
-	    peer_walk(FID_ROOT, 1, "dev") != 0 || peer_walk(1, 2, "mflt") != 0 ||
-	    peer_open(2, OREAD) != 0) {
+	const char *step = "version";
+	if (peer_version() != 0 || (step = "attach", peer_attach(FID_ROOT) != 0) ||
+	    (step = "walk/dev", peer_walk(FID_ROOT, 1, "dev") != 0) ||
+	    (step = "walk/mflt", peer_walk(1, 2, "mflt") != 0) ||
+	    (step = "open", peer_open(2, OREAD) != 0)) {
+		logline("    peer %s: session failed at %s", cga, step);
 		mesh_close();
 		return 0;                       /* peer session didn't establish this cycle */
 	}
@@ -624,12 +633,19 @@ static int cycle(void)
 	if (relay_ok && !nine_ok)
 		logline("  ! 9151/mesh side not responding (uart link degraded) -- relay-only this cycle");
 
+	if (npeers > 0) {
+		char list[400] = "";
+		for (int i = 0; i < npeers; i++) { strncat(list, " ", sizeof(list) - strlen(list) - 1); strncat(list, cgas[i], sizeof(list) - strlen(list) - 1); }
+		logline("  discovered %d peer(s):%s", npeers, list);
+	}
+
 	/* Each in-range peer, over the mesh. */
 	int peer_hits = 0;
 	for (int i = 0; i < npeers && !g_stop; i++) {
+		snprintf(g_where, sizeof(g_where), "peer %s", cgas[i]);
 		int pr = read_peer_mflt(cgas[i], buf, sizeof(buf));
 		if (pr == RC_ERR) return RC_ERR;
-		if (pr > 0) { int got = forward_stream(buf); total += got; if (got) peer_hits++; }
+		if (pr > 0) { int got = forward_stream(buf); total += got; if (got) peer_hits++; logline("    relayed %s (%dB)", cgas[i], pr); }
 	}
 
 	dev_age();
@@ -681,7 +697,7 @@ int main(int argc, char **argv)
 			logline("connected: %s (9P attached)", g_dev);
 		}
 		if (cycle() == RC_ERR) {
-			logline("serial link dropped -- reconnecting");
+			logline("serial link dropped [at: %s] -- reconnecting", g_where);
 			close_serial();
 			sleep_interruptible(2);
 			continue;
