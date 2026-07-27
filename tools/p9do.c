@@ -77,7 +77,7 @@ static int t_write(uint32_t f,uint64_t off,const void*d,int l){
 static int cmd_rd(const char*path){
 	if(t_walk(0,1,path)){printf("%s => WALK FAIL (%s)\n",path,lerr);return -1;}
 	if(t_open(1,0)){printf("%s => OPEN FAIL (%s)\n",path,lerr);t_clunk(1);return -1;}
-	char buf[512];int n=t_read(1,0,(uint8_t*)buf,sizeof buf-1);t_clunk(1);
+	char buf[4096];int n=t_read(1,0,(uint8_t*)buf,sizeof buf-1);t_clunk(1);
 	if(n<0){printf("%s => READ FAIL (%s)\n",path,lerr);return -1;}
 	buf[n]=0; for(int i=0;i<n;i++)if(buf[i]=='\n')buf[i]=' ';
 	printf("%s => %s\n",path,buf); return 0;

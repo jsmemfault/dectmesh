@@ -29,4 +29,10 @@ void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_dr
  * peer's telemetry in one inter-chip read. */
 int aether_net_drain_peer(const uint8_t peer_eui[6], uint8_t *out, size_t cap);
 
+/* Fast, bounded single-Tversion probe of a peer's mesh 9P server. Writes a
+ * one-line human summary (send-result, get-result, reply type) into out; returns
+ * bytes written. Returns in ~2s even against a silent peer, so a 9P read can
+ * carry the result back before the client times out. Diagnostic for dev/mflt_mesh. */
+int aether_net_probe_peer(const uint8_t peer_eui[6], char *out, size_t cap);
+
 #endif /* AETHER_NET_H_ */

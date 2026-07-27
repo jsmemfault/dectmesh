@@ -452,9 +452,24 @@ static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *c
 	uint32_t start = k_uptime_get_32();
 	int total = 0, drained = 0, checked = 0;
 
-	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS; i++)
-		if (g_mesh_ctx->neighbors[i].active) checked++;
-	LOG_INF("mflt_mesh read: %d active neighbor(s)", checked);
+	int eligible = 0;
+	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS; i++) {
+		if (!g_mesh_ctx->neighbors[i].active) continue;
+		checked++;
+		if (memcmp(g_mesh_ctx->neighbors[i].node_eui, zero_eui, 6) != 0)
+			eligible++;
+	}
+	LOG_INF("mflt_mesh read: %d active, %d eligible, cap=%d",
+		checked, eligible, (int)buf_size);
+
+	/* Always emit a header so the read is self-diagnosing even when a small
+	 * client msize or a stuck drain would otherwise yield an empty, silent read
+	 * (the 9151 console is DTR-flaky, so this is the only reliable channel). */
+	if (buf_size > 48) {
+		total += snprintf((char *)buf + total, buf_size - total,
+			"MESHDBG active=%d eligible=%d cap=%d\n",
+			checked, eligible, (int)buf_size);
+	}
 
 	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS && drained < 3; i++) {
 		if (!g_mesh_ctx->neighbors[i].active) {
@@ -465,22 +480,69 @@ static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *c
 		if (memcmp(nb->node_eui, zero_eui, 6) == 0) {
 			continue;   /* null identity == the self entry; skip */
 		}
-		if (total + 512 > (int)buf_size) {
-			break;      /* leave headroom; remaining peers next read */
+		if ((int)buf_size - total < 128) {
+			break;      /* not enough room for even a DBG line; next read */
 		}
 		if (k_uptime_get_32() - start > 10000) {
 			break;      /* time budget: don't block the relay read too long */
 		}
-		/* Address the peer by its durable node_eui and let send_reliable resolve
-		 * it -- exactly what the working host `aether_conv --bridge` passes as the
-		 * conversation peer. (Sending the pre-resolved route or the raw HONR addr
-		 * both failed: send_reliable expects the eui.) */
+		/* Address by durable node_eui (the CGA identity) -- same as the host
+		 * `aether_conv --bridge` and the rest of the stack; the conversation layer
+		 * resolves it to the current HONR route. Self already skipped (null eui). */
+		extern int g_drain_sr, g_drain_gr;
+		g_drain_sr = -99; g_drain_gr = -99;
 		int n = aether_net_drain_peer(nb->node_eui, buf + total, buf_size - total);
 
 		if (n > 0) {
 			total += n;
 			drained++;
+		} else if ((int)buf_size - total > 64) {
+			/* Diagnostic in-band (9151 console is DTR-flaky): send/recv result. */
+			total += snprintf((char *)buf + total, buf_size - total,
+				"DBG %02x%02x%02x%02x%02x%02x: n=%d sr=%d gr=%d\n",
+				nb->node_eui[0], nb->node_eui[1], nb->node_eui[2],
+				nb->node_eui[3], nb->node_eui[4], nb->node_eui[5],
+				n, g_drain_sr, g_drain_gr);
 		}
+	}
+	return total;
+}
+
+/*
+ * dev/mflt_probe -- fast diagnostic: for each eligible neighbor, do ONE bounded
+ * Tversion RPC to its mesh 9P server and report send/get/reply-type. Returns in a
+ * few seconds even against silent peers (unlike a full drain), so the read reliably
+ * carries the answer back. Answers: is the peer reachable at the transport (sr>=0),
+ * and does its mesh 9P server actually reply (gr==0, rtype==101/Rversion)?
+ */
+static int gen_mflt_probe(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (offset || !g_mesh_ctx) {
+		return 0;
+	}
+	static const uint8_t zero_eui[6] = { 0 };
+	int total = 0, probed = 0;
+
+	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS && probed < 3; i++) {
+		if (!g_mesh_ctx->neighbors[i].active) {
+			continue;
+		}
+		struct aether_neighbor *nb = &g_mesh_ctx->neighbors[i];
+
+		if (memcmp(nb->node_eui, zero_eui, 6) == 0) {
+			continue;
+		}
+		if ((int)buf_size - total < 96) {
+			break;
+		}
+		total += aether_net_probe_peer(nb->node_eui,
+			(char *)buf + total, buf_size - total);
+		probed++;
+	}
+	if (probed == 0 && buf_size > 32) {
+		total += snprintf((char *)buf + total, buf_size - total,
+			"PROBE: no eligible neighbors\n");
 	}
 	return total;
 }
@@ -512,6 +574,8 @@ static int register_dev_aether(void)
 	ninep_sysfs_register_file(&sysfs, "dev/mflt", gen_mflt, NULL);
 	/* ... and every in-range mesh peer's chunks, drained over the air in one read. */
 	ninep_sysfs_register_file(&sysfs, "dev/mflt_mesh", gen_mflt_mesh, NULL);
+	/* Fast diagnostic: single-Tversion probe per peer (reachability + reply). */
+	ninep_sysfs_register_file(&sysfs, "dev/mflt_probe", gen_mflt_probe, NULL);
 #endif
 	return 0;
 }

@@ -125,6 +125,13 @@ struct aether_net_fs {
 
 static struct aether_net_fs g_fs;
 
+/* Drain diagnostics, surfaced in the dev/mflt_mesh output (the 9151 console is
+ * unreliable under a concurrent 9P session -- shared DTR). Set by the drain path,
+ * read by gen_mflt_mesh. */
+int g_drain_sr = -99;   /* last send_reliable() return */
+int g_drain_gr = -99;   /* last k_msgq_get() return (0 = got a datagram) */
+int g_drain_step = 0;   /* furthest step: 1=ver 2=att 3=walk 4=open 5=read */
+
 /* ---- helpers ---- */
 
 static inline struct anode *AN(struct ninep_fs_node *n) { return n->data; }
@@ -281,9 +288,15 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 	    aether_mesh_addr_to_eui(g_fs.iface, src, ident_buf) == 0) {
 		ident = ident_buf;
 	}
+	if (!broadcast && len >= 7) {
+		LOG_INF("recv unicast src=%02x:%02x:%02x:%02x:%02x:%02x R%u len=%d",
+			src[0], src[1], src[2], src[3], src[4], src[5],
+			payload[4], (int)len);
+	}
 	k_mutex_lock(&g_fs.lock, K_FOREVER);
 	g_fs.ctr.rx++;
 	g_fs.ctr.rx_bytes += (uint32_t)len;
+	int took = 0;
 	for (int i = 0; i < AETHER_MAX_CONNS; i++) {
 		struct aether_conv *c = &g_fs.convs[i];
 
@@ -325,9 +338,14 @@ static void aether_recv_cb(struct net_if *iface, const uint8_t src[6],
 		if (k_msgq_put(&c->rxq, &d, K_NO_WAIT) != 0) {
 			g_fs.ctr.rx_drop++;
 			LOG_WRN("conv %d rxq full, dropping datagram", i);
+		} else {
+			took++;
 		}
 	}
 	k_mutex_unlock(&g_fs.lock);
+	if (!broadcast && len >= 7 && took == 0) {
+		LOG_INF("recv unicast: NO conv took it (no CONNECTED match)");
+	}
 }
 
 /* ---- ctl command grammar (spec §5) ---- */
@@ -814,25 +832,27 @@ static int m9_rpc(struct aether_conv *c, uint8_t *msg, int len, uint8_t *rbuf, i
 {
 	np32(msg, (uint32_t)len);
 	uint16_t want = ng16(msg + 5);
-	/* c->peer is the peer's current HONR route (a routable address), set by the
-	 * caller from the neighbor table -- send to it directly. (Routing by the
-	 * durable node_eui needs the flooded binding table, which isn't always
-	 * populated even when the neighbor is known, so send_reliable would stall.) */
+	/* c->peer is the durable node_eui; resolve it to the peer's current HONR route
+	 * exactly as anet_write's CONNECTED send does (fallback to the eui). */
+	uint8_t route[6];
 	const uint8_t *dst = c->peer;
 
-	for (int attempt = 0; attempt < 3; attempt++) {
+	if (aether_mesh_eui_to_addr(g_fs.iface, c->peer, route) == 0) {
+		dst = route;
+	}
+	for (int attempt = 0; attempt < 2; attempt++) {
 		int sr = aether_mesh_send_reliable(g_fs.iface, dst, msg, len,
 						   AETHER_NET_RETRIES);
+		g_drain_sr = sr;
 		if (sr < 0) {
-			if (attempt == 0) {
-				LOG_WRN("drain: send_reliable(%02x:%02x) = %d", dst[4], dst[5], sr);
-			}
 			continue;
 		}
-		for (int reads = 0; reads < 4; reads++) {
+		for (int reads = 0; reads < 2; reads++) {
 			struct aether_dgram d;
+			int gr = k_msgq_get(&c->rxq, &d, K_MSEC(1500));
 
-			if (k_msgq_get(&c->rxq, &d, K_MSEC(2500)) != 0) {
+			g_drain_gr = gr;
+			if (gr != 0) {
 				break;              /* no reply this attempt -> resend */
 			}
 			if (d.len == 0) {
@@ -923,6 +943,102 @@ done:
 	conv_free(c);
 	k_mutex_unlock(&g_fs.lock);
 	return total;
+}
+
+/*
+ * Fast single-RPC probe: send ONE Tversion to the peer and wait briefly for the
+ * Rversion. Bounded to a couple of seconds so a read can return the result while
+ * the client is still listening (unlike a full drain, whose blocking send_reliable
+ * retries against a silent peer outlast the client watchdog). Writes a one-line
+ * human summary of send-result (sr), get-result (gr), and the reply type. */
+int aether_net_probe_peer(const uint8_t peer_eui[6], char *out, size_t cap)
+{
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	struct aether_conv *c = conv_alloc();
+
+	k_mutex_unlock(&g_fs.lock);
+	if (!c) {
+		return snprintf(out, cap, "PROBE %02x%02x%02x%02x%02x%02x: conv_alloc FAILED\n",
+			peer_eui[0], peer_eui[1], peer_eui[2],
+			peer_eui[3], peer_eui[4], peer_eui[5]);
+	}
+	memcpy(c->peer, peer_eui, 6);
+	c->state = CONV_CONNECTED;
+
+	/* Resolve eui -> current HONR route (same as anet_write's CONNECTED send). */
+	uint8_t route[6];
+	const uint8_t *dst = c->peer;
+	int resolved = aether_mesh_eui_to_addr(g_fs.iface, c->peer, route);
+
+	if (resolved == 0) {
+		dst = route;
+	}
+
+	/* Run the full 9P session (version->attach->walk->open->read) exactly as
+	 * drain_peer does, but record the reply type at each step so a read that
+	 * returns empty tells us precisely which step failed. m9_rpc stamps the size
+	 * prefix and resolves the route itself. */
+	uint8_t msg[64];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	uint16_t tag = 1;
+	int o, r;
+	int t_ver = -1, t_att = -1, t_walk = -1, t_open = -1, rdbytes = -1;
+
+	/* Tversion */
+	o = 4; msg[o++] = 100; np16(msg + o, 0xffff); o += 2;
+	np32(msg + o, AETHER_MAX_MSG); o += 4;
+	np16(msg + o, 6); o += 2; memcpy(msg + o, "9P2000", 6); o += 6;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	t_ver = (r > 4) ? rbuf[4] : r;
+	if (r >= 5 && rbuf[4] == 101) {
+		/* Tattach fid 0 */
+		o = 4; msg[o++] = 104; np16(msg + o, tag++); o += 2;
+		np32(msg + o, 0); o += 4; np32(msg + o, 0xffffffffu); o += 4;
+		np16(msg + o, 1); o += 2; msg[o++] = 't'; np16(msg + o, 0); o += 2;
+		r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+		t_att = (r > 4) ? rbuf[4] : r;
+	}
+	if (t_att == 105) {
+		/* Twalk fid 0 -> 2: ["dev","mflt"] */
+		o = 4; msg[o++] = 110; np16(msg + o, tag++); o += 2;
+		np32(msg + o, 0); o += 4; np32(msg + o, 2); o += 4;
+		np16(msg + o, 2); o += 2;
+		np16(msg + o, 3); o += 2; memcpy(msg + o, "dev", 3); o += 3;
+		np16(msg + o, 4); o += 2; memcpy(msg + o, "mflt", 4); o += 4;
+		r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+		t_walk = (r > 4) ? rbuf[4] : r;
+	}
+	if (t_walk == 111) {
+		/* Topen fid 2 OREAD */
+		o = 4; msg[o++] = 112; np16(msg + o, tag++); o += 2;
+		np32(msg + o, 2); o += 4; msg[o++] = 0;
+		r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+		t_open = (r > 4) ? rbuf[4] : r;
+	}
+	if (t_open == 113) {
+		/* One Tread */
+		o = 4; msg[o++] = 116; np16(msg + o, tag++); o += 2;
+		np32(msg + o, 2); o += 4;
+		np32(msg + o, 0); o += 4; np32(msg + o, 0); o += 4;
+		np32(msg + o, (uint32_t)(AETHER_MAX_MSG - 16)); o += 4;
+		r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+		if (r >= 11 && rbuf[4] == 117) {
+			rdbytes = (int)ng32(rbuf + 7);
+		} else {
+			rdbytes = (r > 4) ? -(int)rbuf[4] : r;   /* -type or errno */
+		}
+	}
+
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	conv_free(c);
+	k_mutex_unlock(&g_fs.lock);
+
+	return snprintf(out, cap,
+		"PROBE %02x%02x%02x%02x%02x%02x route=%02x%02x%02x%02x%02x%02x(r=%d) "
+		"ver=%d att=%d walk=%d open=%d read=%d\n",
+		peer_eui[0], peer_eui[1], peer_eui[2], peer_eui[3], peer_eui[4], peer_eui[5],
+		dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], resolved,
+		t_ver, t_att, t_walk, t_open, rdbytes);
 }
 
 void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops)

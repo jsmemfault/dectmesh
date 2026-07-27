@@ -218,6 +218,10 @@ static int rpc_to(int len, int timeout_ms)
 }
 
 #define TMO 4000   /* default per-op timeout, ms */
+#define DRAIN_TMO 30000  /* dev/mflt_mesh: the 9151 runs a full mesh 9P session per
+			  * peer (version/attach/walk/open/read×N) over the air before
+			  * replying -- seconds per peer. The relay's Tread timeout is
+			  * 5 min; the client just needs to out-wait the on-air drain. */
 
 static int do_version(void)
 {
@@ -325,6 +329,25 @@ static int read_file(const char *path, char *out, int cap)
 	out[total] = 0;
 	do_clunk(FID_FILE);
 	return total;
+}
+
+/* Single-read drain for dev/mflt_mesh: the 9151 collects EVERY peer's chunks over
+ * the air in one shot, so one large read gets them all. Unlike read_file's loop,
+ * we do NOT re-read at offset 0 -- for this file a re-read would re-run the whole
+ * multi-second mesh 9P drain against now-empty peers (draining consumes the peer's
+ * chunks), wasting seconds per cycle for nothing. One read, up to cap. */
+static int read_drain(const char *path, char *out, int cap)
+{
+	int w = do_walk(FID_ROOT, FID_FILE, path);
+	if (w < 0) return w;
+	if (w == -3) return 0;
+	if (do_open(FID_FILE, OREAD) != 0) { do_clunk(FID_FILE); return 0; }
+	int r = do_read(FID_FILE, 0, (uint8_t *)out, cap - 1, DRAIN_TMO);
+	do_clunk(FID_FILE);
+	if (r == RC_ERR || r == RC_TIMEOUT) return r;
+	if (r < 0) r = 0;
+	out[r] = 0;
+	return r;
 }
 
 /* ---- mesh conversation tunnel (a peer's dev/mflt over the air) ------------ */
@@ -628,7 +651,7 @@ static int cycle(void)
 	 * forwards through the same generic loop. This read can block a few seconds
 	 * while the 9151 drains peers (the relay's Tread timeout is 5 min). */
 	snprintf(g_where, sizeof(g_where), "dev/mflt_mesh");
-	r = read_file("dev/mflt_mesh", buf, sizeof(buf));
+	r = read_drain("dev/mflt_mesh", buf, sizeof(buf));
 	if (r == RC_ERR) return RC_ERR;
 	if (r == RC_TIMEOUT) nine_ok = 0;
 	int peer_chunks = (r > 0) ? forward_stream(buf) : 0;

@@ -1325,6 +1325,26 @@ static int mflt_mesh_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx
 	(void)ninep_client_clunk(&mesh_client, fid);
 	return ret;
 }
+
+/* dev/mflt_probe -- proxy the 9151's fast per-peer mesh-9P reachability probe (a
+ * single bounded Tversion RPC per neighbor). Diagnostic for the dev/mflt_mesh
+ * drain: shows send-result/get-result/reply-type. Same pass-through as mflt_mesh. */
+static int mflt_probe_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	uint32_t fid;
+	int ret = fw9151_open_remote("dev/mflt_probe", NINEP_OREAD, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret;
+}
 #endif /* CONFIG_MEMFAULT */
 
 /*
@@ -1409,6 +1429,7 @@ static int fw_9p_init(void)
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt5340", mflt5340_read, NULL);
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt9151", mflt9151_read, NULL);
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt_mesh", mflt_mesh_read, NULL);
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt_probe", mflt_probe_read, NULL);
 #endif
 
 	/* dev/fw9151auto: toggle post-swap auto-confirm of the 9151 (default on). */
