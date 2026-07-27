@@ -471,9 +471,11 @@ static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *c
 		if (k_uptime_get_32() - start > 10000) {
 			break;      /* time budget: don't block the relay read too long */
 		}
-		/* Route by the neighbor's current HONR addr (a routable address in the
-		 * table); the peer's own dev/mflt still self-describes with its CGA. */
-		int n = aether_net_drain_peer(nb->addr, buf + total, buf_size - total);
+		/* Address the peer by its durable node_eui and let send_reliable resolve
+		 * it -- exactly what the working host `aether_conv --bridge` passes as the
+		 * conversation peer. (Sending the pre-resolved route or the raw HONR addr
+		 * both failed: send_reliable expects the eui.) */
+		int n = aether_net_drain_peer(nb->node_eui, buf + total, buf_size - total);
 
 		if (n > 0) {
 			total += n;
