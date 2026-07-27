@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd service for the hardened Aether telemetry forwarder (macOS gateway).
+
+  Runs tools/aether_forwarder continuously and restarts it if it ever exits
+  (the daemon already auto-reconnects internally, so KeepAlive is just a backstop
+  for a hard crash / logout). Devices coming and going across the mesh is handled
+  inside the daemon -- no per-node config here.
+
+  INSTALL (do NOT commit your real project key -- this file is a template):
+    1. cp tools/aether_forwarder.plist.example ~/Library/LaunchAgents/com.aether.forwarder.plist
+    2. edit it: set the absolute path to the built binary, the gateway port suffix
+       (e.g. 1203) + interval, and your MEMFAULT_PROJECT_KEY.
+    3. launchctl load  ~/Library/LaunchAgents/com.aether.forwarder.plist
+       launchctl start com.aether.forwarder
+    4. tail -f /tmp/aether_forwarder.log
+    unload: launchctl unload ~/Library/LaunchAgents/com.aether.forwarder.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aether.forwarder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/dect/tools/aether_forwarder</string>
+    <string>1203</string>   <!-- gateway 9P port suffix (or a full /dev path) -->
+    <string>30</string>     <!-- collection interval, seconds -->
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MEMFAULT_PROJECT_KEY</key>
+    <string>REPLACE_WITH_YOUR_MEMFAULT_PROJECT_KEY</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/aether_forwarder.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/aether_forwarder.log</string>
+</dict>
+</plist>
