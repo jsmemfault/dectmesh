@@ -460,10 +460,10 @@ static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *c
 		if (!g_mesh_ctx->neighbors[i].active) {
 			continue;
 		}
-		const uint8_t *eui = g_mesh_ctx->neighbors[i].node_eui;
+		struct aether_neighbor *nb = &g_mesh_ctx->neighbors[i];
 
-		if (memcmp(eui, zero_eui, 6) == 0) {
-			continue;   /* identity unknown -> can't address durably */
+		if (memcmp(nb->node_eui, zero_eui, 6) == 0) {
+			continue;   /* null identity == the self entry; skip */
 		}
 		if (total + 512 > (int)buf_size) {
 			break;      /* leave headroom; remaining peers next read */
@@ -471,7 +471,9 @@ static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *c
 		if (k_uptime_get_32() - start > 10000) {
 			break;      /* time budget: don't block the relay read too long */
 		}
-		int n = aether_net_drain_peer(eui, buf + total, buf_size - total);
+		/* Route by the neighbor's current HONR addr (a routable address in the
+		 * table); the peer's own dev/mflt still self-describes with its CGA. */
+		int n = aether_net_drain_peer(nb->addr, buf + total, buf_size - total);
 
 		if (n > 0) {
 			total += n;

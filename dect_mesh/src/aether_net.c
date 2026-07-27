@@ -814,12 +814,12 @@ static int m9_rpc(struct aether_conv *c, uint8_t *msg, int len, uint8_t *rbuf, i
 {
 	np32(msg, (uint32_t)len);
 	uint16_t want = ng16(msg + 5);
-	uint8_t route[6];
+	/* c->peer is the peer's current HONR route (a routable address), set by the
+	 * caller from the neighbor table -- send to it directly. (Routing by the
+	 * durable node_eui needs the flooded binding table, which isn't always
+	 * populated even when the neighbor is known, so send_reliable would stall.) */
 	const uint8_t *dst = c->peer;
 
-	if (aether_mesh_eui_to_addr(g_fs.iface, c->peer, route) == 0) {
-		dst = route;
-	}
 	for (int attempt = 0; attempt < 3; attempt++) {
 		int sr = aether_mesh_send_reliable(g_fs.iface, dst, msg, len,
 						   AETHER_NET_RETRIES);
