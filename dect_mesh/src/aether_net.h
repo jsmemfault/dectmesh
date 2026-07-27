@@ -35,4 +35,14 @@ int aether_net_drain_peer(const uint8_t peer_eui[6], uint8_t *out, size_t cap);
  * carry the result back before the client times out. Diagnostic for dev/mflt_mesh. */
 int aether_net_probe_peer(const uint8_t peer_eui[6], char *out, size_t cap);
 
+/* OTA over the mesh (the write twin of the drain): stream a signed image to a
+ * peer's dev/firmware, then reboot/confirm it -- all over a mesh conversation, no
+ * wires to the target. push_open holds a streaming session, push_write forwards
+ * host chunks, push_close clunks (peer requests upgrade). push_ctl is a one-shot
+ * write of "1" to a peer control file (dev/reboot / dev/confirm). */
+int aether_net_push_open(const uint8_t peer_eui[6]);
+int aether_net_push_write(const uint8_t *buf, uint32_t count, uint64_t offset);
+int aether_net_push_close(void);
+int aether_net_push_ctl(const uint8_t peer_eui[6], const char *file, bool expect_reset);
+
 #endif /* AETHER_NET_H_ */

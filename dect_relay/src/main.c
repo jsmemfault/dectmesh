@@ -1095,6 +1095,94 @@ static int fw9151_clunk(void *ctx)
 	return ret;
 }
 
+/* --- OTA over the mesh (proxy) -------------------------------------------------
+ * The host drives an OTA of a REMOTE mesh peer through the gateway: it writes
+ * commands to dev/push_ctl (target/commit/reboot/confirm) and streams the signed
+ * image to dev/push. Both just forward to the gateway's 9151, which runs the real
+ * mesh 9P write session to the target peer (aether_net_push_*). We hold NO image
+ * here -- pure pass-through, so the ~300 KB never lands in the relay's RAM either.
+ */
+static uint32_t push_wfid;
+static bool push_writing;
+
+/* dev/push_ctl: one-shot command forwarded to the 9151. Each command that touches
+ * the mesh (target/commit/reboot/confirm) blocks on the 9151 for the on-air op, so
+ * the client write out-waits it via the same long Tread/Twrite budget as fw9151. */
+static int push_ctl_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(off); ARG_UNUSED(ctx);
+	uint32_t fid;
+	int ret = fw9151_open_remote("dev/push_ctl", NINEP_OWRITE, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_write(&mesh_client, fid, 0, buf, count);
+	(void)ninep_client_clunk(&mesh_client, fid);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	return ret < 0 ? ret : (int)count;
+}
+
+/* dev/push: stream the image to the 9151's dev/push, PRESERVING the host offset so
+ * the 9151 forwards each chunk to the peer's dev/firmware at the right position.
+ * Sub-chunked for the uart1 flow-control reason (same as fw9151_write). */
+static int push_write(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	int ret;
+
+	k_mutex_lock(&mesh_wr, K_FOREVER);
+	if (!push_writing) {
+		ret = fw9151_open_remote("dev/push", NINEP_OWRITE, &push_wfid);
+		if (ret < 0) {
+			k_mutex_unlock(&mesh_wr);
+			return ret;
+		}
+		push_writing = true;
+		LOG_INF("push: mesh-OTA stream started");
+	}
+	uint32_t done = 0;
+
+	while (done < count) {
+		uint32_t n = count - done;
+
+		if (n > CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK) {
+			n = CONFIG_NINEP_REMOTE_FS_WRITE_CHUNK;
+		}
+		ret = ninep_client_write(&mesh_client, push_wfid, off + done, buf + done, n);
+		if (ret < 0) {
+			LOG_ERR("push: remote write failed: %d", ret);
+			ninep_client_clunk(&mesh_client, push_wfid);
+			push_writing = false;
+			k_mutex_unlock(&mesh_wr);
+			return ret;
+		}
+		done += (uint32_t)ret;
+		if ((uint32_t)ret < n) {
+			break;
+		}
+	}
+	k_mutex_unlock(&mesh_wr);
+	return (int)done;
+}
+
+static int push_clunk(void *ctx)
+{
+	ARG_UNUSED(ctx);
+	int ret = 0;
+
+	k_mutex_lock(&mesh_wr, K_FOREVER);
+	if (push_writing) {
+		ret = ninep_client_clunk(&mesh_client, push_wfid);
+		push_writing = false;
+		LOG_INF("push: mesh-OTA stream closed");
+	}
+	k_mutex_unlock(&mesh_wr);
+	return ret;
+}
+
 /*
  * One-shot proxied write to a remote 9151 control node (walk+open+write+clunk).
  * Used for dev/reboot and dev/confirm so the whole 9151 DFU cycle -- stage,
@@ -1416,6 +1504,13 @@ static int fw_9p_init(void)
 						 NULL, fw9151_reboot_write, NULL);
 	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/confirm9151",
 						 NULL, fw9151_confirm_write, NULL);
+
+	/* OTA over the mesh: forward push commands + image stream to the 9151, which
+	 * runs the real mesh 9P write session to the target peer (no wires to it). */
+	(void)ninep_sysfs_register_writable_file(&fw_sysfs, "dev/push_ctl",
+						 NULL, push_ctl_write, NULL);
+	(void)ninep_sysfs_register_writable_file_ex(&fw_sysfs, "dev/push",
+						    NULL, push_write, push_clunk, NULL);
 
 	/* dev/link9151: read-only 5340<->9151 link health (instant, never proxied). */
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/link9151",

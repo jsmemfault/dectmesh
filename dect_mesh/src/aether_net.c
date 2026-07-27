@@ -1041,6 +1041,232 @@ int aether_net_probe_peer(const uint8_t peer_eui[6], char *out, size_t cap)
 		t_ver, t_att, t_walk, t_open, rdbytes);
 }
 
+/* ---- OTA over the mesh: push a signed image (or a control write) to a peer ----
+ *
+ * The write twin of aether_net_drain_peer. A peer's mesh 9P server already serves
+ * its own dev/firmware (ninep_dfu -> MCUboot secondary slot), dev/reboot and
+ * dev/confirm over the mesh (same namespace as USB/UART), so OTA-over-mesh is a
+ * pure CLIENT feature here: run a 9P write session to the peer over a conversation.
+ *
+ * The image (~300 KB) will NOT fit in the 9151's RAM, so the push STREAMS: the host
+ * feeds chunks to dev/push and each is forwarded as a mesh Twrite to the peer's
+ * held dev/firmware fid. The session (conv + fid + offset) lives in g_push across
+ * many sysfs write calls -- exactly the relay's fw9151_write pattern, mesh-side. */
+static struct {
+	struct aether_conv *conv;
+	uint8_t  peer[6];
+	uint32_t fid;       /* peer's open dev/firmware fid */
+	uint16_t tag;
+	uint64_t woff;      /* bytes streamed so far */
+	bool     active;
+} g_push;
+
+/* Build a 9P session on conv c up to an open fid 2 for dev/<file> with `mode`.
+ * version -> attach(fid 0) -> walk(0->2 ["dev", file]) -> open(fid 2, mode).
+ * Returns 0 on success (fid 2 open), or a negative step code for diagnostics. */
+static int m9_open_devfile(struct aether_conv *c, uint16_t *tag,
+			   const char *file, uint8_t mode)
+{
+	uint8_t msg[80];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	int o, r;
+	int flen = (int)strlen(file);
+
+	/* Tversion */
+	o = 4; msg[o++] = 100; np16(msg + o, 0xffff); o += 2;
+	np32(msg + o, AETHER_MAX_MSG); o += 4;
+	np16(msg + o, 6); o += 2; memcpy(msg + o, "9P2000", 6); o += 6;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 101) { return -1; }
+
+	/* Tattach fid 0 */
+	o = 4; msg[o++] = 104; np16(msg + o, (*tag)++); o += 2;
+	np32(msg + o, 0); o += 4; np32(msg + o, 0xffffffffu); o += 4;
+	np16(msg + o, 1); o += 2; msg[o++] = 't'; np16(msg + o, 0); o += 2;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 105) { return -2; }
+
+	/* Twalk fid 0 -> 2: ["dev", file] */
+	o = 4; msg[o++] = 110; np16(msg + o, (*tag)++); o += 2;
+	np32(msg + o, 0); o += 4; np32(msg + o, 2); o += 4;
+	np16(msg + o, 2); o += 2;
+	np16(msg + o, 3); o += 2; memcpy(msg + o, "dev", 3); o += 3;
+	np16(msg + o, flen); o += 2; memcpy(msg + o, file, flen); o += flen;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 111) { return -3; }   /* Rwalk */
+
+	/* Topen fid 2 mode */
+	o = 4; msg[o++] = 112; np16(msg + o, (*tag)++); o += 2;
+	np32(msg + o, 2); o += 4; msg[o++] = mode;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 113) { return -4; }   /* Ropen */
+
+	return 0;
+}
+
+/* Open a streaming DFU write session to peer's dev/firmware. Holds g_push. */
+int aether_net_push_open(const uint8_t peer_eui[6])
+{
+	if (g_push.active) {
+		return -EBUSY;
+	}
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	struct aether_conv *c = conv_alloc();
+
+	k_mutex_unlock(&g_fs.lock);
+	if (!c) {
+		return -ENOSPC;
+	}
+	memcpy(c->peer, peer_eui, 6);
+	c->state = CONV_CONNECTED;
+
+	g_push.tag = 1;
+	int r = m9_open_devfile(c, &g_push.tag, "firmware", 1 /* OWRITE */);
+
+	if (r < 0) {
+		LOG_WRN("push %02x:%02x: open dev/firmware failed at step %d",
+			peer_eui[4], peer_eui[5], r);
+		k_mutex_lock(&g_fs.lock, K_FOREVER);
+		conv_free(c);
+		k_mutex_unlock(&g_fs.lock);
+		return r;
+	}
+	g_push.conv = c;
+	memcpy(g_push.peer, peer_eui, 6);
+	g_push.fid = 2;
+	g_push.woff = 0;
+	g_push.active = true;
+	LOG_INF("push %02x:%02x: dev/firmware open, streaming", peer_eui[4], peer_eui[5]);
+	return 0;
+}
+
+/* Stream `count` bytes at `offset` to the peer's dev/firmware, splitting into
+ * mesh-payload-sized Twrites. Returns bytes accepted (>=0) or negative. */
+int aether_net_push_write(const uint8_t *buf, uint32_t count, uint64_t offset)
+{
+	if (!g_push.active) {
+		return -EPIPE;
+	}
+	/* Twrite header = size[4]+type[1]+tag[2]+fid[4]+offset[8]+count[4] = 23. */
+	const uint32_t hdr = 23;
+	const uint32_t maxdata = AETHER_MAX_MSG - hdr;
+	uint8_t msg[AETHER_MAX_MSG];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	uint32_t done = 0;
+
+	while (done < count) {
+		uint32_t n = count - done;
+
+		if (n > maxdata) { n = maxdata; }
+
+		int o = 4;
+
+		msg[o++] = 118; np16(msg + o, g_push.tag++); o += 2;   /* Twrite */
+		np32(msg + o, g_push.fid); o += 4;
+		np32(msg + o, (uint32_t)(offset + done)); o += 4;
+		np32(msg + o, (uint32_t)((offset + done) >> 32)); o += 4;
+		np32(msg + o, n); o += 4;
+		memcpy(msg + o, buf + done, n); o += n;
+
+		int r = m9_rpc(g_push.conv, msg, o, rbuf, sizeof(rbuf));
+
+		if (r < 11 || rbuf[4] != 119) {   /* Rwrite */
+			LOG_ERR("push: Twrite failed at off %llu (r=%d type=%d)",
+				offset + done, r, r > 4 ? rbuf[4] : -1);
+			return -EIO;
+		}
+		uint32_t wr = ng32(rbuf + 7);
+
+		if (wr == 0) { break; }
+		done += wr;
+		if (wr < n) { break; }   /* short write */
+	}
+	g_push.woff = offset + done;
+	return (int)done;
+}
+
+/* Finalize: clunk the peer's dev/firmware fid -> its ninep_dfu requests the
+ * upgrade. Frees the conversation. */
+int aether_net_push_close(void)
+{
+	if (!g_push.active) {
+		return -EPIPE;
+	}
+	uint8_t msg[16];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	int o = 4;
+
+	msg[o++] = 120; np16(msg + o, g_push.tag++); o += 2;   /* Tclunk */
+	np32(msg + o, g_push.fid); o += 4;
+	(void)m9_rpc(g_push.conv, msg, o, rbuf, sizeof(rbuf));   /* Rclunk best-effort */
+
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	conv_free(g_push.conv);
+	k_mutex_unlock(&g_fs.lock);
+	LOG_INF("push %02x:%02x: DFU stream finalized (%llu bytes); peer will upgrade",
+		g_push.peer[4], g_push.peer[5], g_push.woff);
+	g_push.active = false;
+	g_push.conv = NULL;
+	return 0;
+}
+
+/* One-shot control write to a peer's dev/<file> ("1"), over the mesh. Used for
+ * dev/reboot (swap) and dev/confirm (mark good). If expect_reset, the peer resets
+ * mid-reply so a missing Rwrite/Rclunk is success once the request is on the wire. */
+int aether_net_push_ctl(const uint8_t peer_eui[6], const char *file, bool expect_reset)
+{
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	struct aether_conv *c = conv_alloc();
+
+	k_mutex_unlock(&g_fs.lock);
+	if (!c) {
+		return -ENOSPC;
+	}
+	memcpy(c->peer, peer_eui, 6);
+	c->state = CONV_CONNECTED;
+
+	uint16_t tag = 1;
+	int r = m9_open_devfile(c, &tag, file, 1 /* OWRITE */);
+
+	if (r < 0) {
+		k_mutex_lock(&g_fs.lock, K_FOREVER);
+		conv_free(c);
+		k_mutex_unlock(&g_fs.lock);
+		LOG_WRN("push_ctl %02x:%02x dev/%s: open failed step %d",
+			peer_eui[4], peer_eui[5], file, r);
+		return r;
+	}
+
+	uint8_t msg[32];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	int o = 4;
+
+	msg[o++] = 118; np16(msg + o, tag++); o += 2;   /* Twrite fid 2 "1" */
+	np32(msg + o, 2); o += 4;
+	np32(msg + o, 0); o += 4; np32(msg + o, 0); o += 4;
+	np32(msg + o, 1); o += 4; msg[o++] = '1';
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+
+	int ret = 0;
+
+	if (expect_reset) {
+		ret = 0;   /* peer reboots mid-reply; the write is on the wire = success */
+	} else if (r < 11 || rbuf[4] != 119) {
+		ret = -EIO;
+	}
+
+	/* Tclunk (best-effort; skip fuss if the peer already reset). */
+	o = 4; msg[o++] = 120; np16(msg + o, tag++); o += 2; np32(msg + o, 2); o += 4;
+	(void)m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	conv_free(c);
+	k_mutex_unlock(&g_fs.lock);
+	LOG_INF("push_ctl %02x:%02x dev/%s: %s", peer_eui[4], peer_eui[5], file,
+		ret == 0 ? "ok" : "FAILED");
+	return ret;
+}
+
 void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops)
 {
 	if (data_tx) {

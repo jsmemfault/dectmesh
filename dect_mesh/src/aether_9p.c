@@ -337,6 +337,9 @@ static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 	}
 }
 
+static int write_push_ctl(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx);
+static int write_push(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx);
+
 static int register_dev(void)
 {
 	int ret;
@@ -349,6 +352,13 @@ static int register_dev(void)
 						 NULL, dfu_write_reboot, NULL);
 	(void)ninep_sysfs_register_writable_file(&sysfs, "dev/confirm",
 						 NULL, dfu_write_confirm, NULL);
+
+	/* OTA over the mesh: push a signed image to a PEER's dev/firmware and swap it,
+	 * all over a mesh conversation (the write twin of the dev/mflt_mesh drain). */
+	(void)ninep_sysfs_register_writable_file(&sysfs, "dev/push_ctl",
+						 NULL, write_push_ctl, NULL);
+	(void)ninep_sysfs_register_writable_file(&sysfs, "dev/push",
+						 NULL, write_push, NULL);
 
 	struct ninep_dfu_config dfu_cfg = {
 		.path = "dev/firmware",
@@ -547,6 +557,73 @@ static int gen_mflt_probe(uint8_t *buf, size_t buf_size, uint64_t offset, void *
 	return total;
 }
 #endif /* CONFIG_MEMFAULT */
+
+/* ---- OTA over the mesh: dev/push_ctl + dev/push (host-driven, relay-proxied) --- */
+
+static int hexnib(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Parse 12 hex chars -> 6-byte node_eui. Returns 0 on success. */
+static int parse_eui12(const char *s, int len, uint8_t out[6])
+{
+	if (len < 12) return -1;
+	for (int i = 0; i < 6; i++) {
+		int hi = hexnib(s[i * 2]), lo = hexnib(s[i * 2 + 1]);
+
+		if (hi < 0 || lo < 0) return -1;
+		out[i] = (uint8_t)((hi << 4) | lo);
+	}
+	return 0;
+}
+
+/*
+ * dev/push_ctl -- drive an OTA-over-mesh cycle from the host. Commands (one per
+ * write): "target <eui12>" opens a streaming DFU session to that peer's
+ * dev/firmware; then the host streams the signed image to dev/push; "commit"
+ * clunks the peer fid (peer requests upgrade); "reboot <eui12>" and
+ * "confirm <eui12>" swap and mark-good the peer -- all over the mesh, no wires
+ * to the target node.
+ */
+static int write_push_ctl(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(off); ARG_UNUSED(ctx);
+	char cmd[64];
+	uint32_t n = MIN(count, (uint32_t)sizeof(cmd) - 1);
+
+	memcpy(cmd, buf, n); cmd[n] = 0;
+	while (n > 0 && (cmd[n - 1] == '\n' || cmd[n - 1] == '\r' || cmd[n - 1] == ' ')) {
+		cmd[--n] = 0;
+	}
+
+	uint8_t eui[6];
+	int r;
+
+	if (!strncmp(cmd, "target ", 7) && parse_eui12(cmd + 7, (int)n - 7, eui) == 0) {
+		r = aether_net_push_open(eui);
+	} else if (!strncmp(cmd, "commit", 6)) {
+		r = aether_net_push_close();
+	} else if (!strncmp(cmd, "reboot ", 7) && parse_eui12(cmd + 7, (int)n - 7, eui) == 0) {
+		r = aether_net_push_ctl(eui, "reboot", true);
+	} else if (!strncmp(cmd, "confirm ", 8) && parse_eui12(cmd + 8, (int)n - 8, eui) == 0) {
+		r = aether_net_push_ctl(eui, "confirm", false);
+	} else {
+		LOG_WRN("push_ctl: bad command '%s'", cmd);
+		return -EINVAL;
+	}
+	return (r == 0) ? (int)count : r;
+}
+
+/* dev/push -- stream signed-image chunks to the peer opened by push_ctl target. */
+static int write_push(const uint8_t *buf, uint32_t count, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	return aether_net_push_write(buf, count, off);
+}
 
 /*
  * Node-state files under /dev/aether (spec §10: node state -- addr/rank/tree/
