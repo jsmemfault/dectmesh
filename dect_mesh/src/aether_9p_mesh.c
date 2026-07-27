@@ -108,9 +108,13 @@ static int mesh9p_send(struct ninep_transport *transport, const uint8_t *buf,
 {
 	ARG_UNUSED(transport);
 
-	/* 9P is intolerant of a single lost message, so give the reply's ARQ a
-	 * generous retry budget -- a dropped R aborts the whole session. */
-	int ret = aether_mesh_send_reliable(mesh_iface, req_peer, buf, len, 8);
+	/* Reply reliably, but with a BOUNDED retry budget: req_busy is held for the
+	 * whole duration of this send, and while it is held every incoming T is dropped
+	 * as "busy". A long reply-ARQ stall (e.g. the requester's ACK is slow) therefore
+	 * blocks the NEXT request for seconds -- fatal to a streaming session (OTA) where
+	 * the requester's retransmit keeps hitting a busy peer. A short budget frees
+	 * req_busy fast; the requester's own retry covers the rare genuinely-lost R. */
+	int ret = aether_mesh_send_reliable(mesh_iface, req_peer, buf, len, 3);
 
 	return ret == 0 ? (int)len : ret;
 }

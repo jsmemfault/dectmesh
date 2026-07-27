@@ -319,6 +319,93 @@ static int do_put(const char *path, const char *file, int chunk)
 	return 0;
 }
 
+/* Write a short string to a gateway control file (walk+open+write+clunk on fid 1).
+ * Used for the dev/push_ctl commands. Returns 0 on success. */
+static int ctl_write(const char *path, const char *str)
+{
+	if (do_walk(0, 1, path)) { fprintf(stderr, "walk %s failed\n", path); return -1; }
+	if (do_open(1, OWRITE)) { fprintf(stderr, "open %s failed\n", path); do_clunk(1); return -1; }
+	int w = do_pwrite(1, 0, str, (int)strlen(str));
+
+	do_clunk(1);
+	return (w < 0) ? -1 : 0;
+}
+
+/*
+ * OTA a REMOTE mesh peer over the air, all in ONE 9P session (no socat bouncing,
+ * no tool-switching -- the multi-connection churn is what kept breaking):
+ *   dev/push_ctl "target <eui>"  -> gateway opens a mesh DFU session to the peer
+ *   dev/push <image stream>      -> each chunk -> one mesh Twrite to the peer
+ *   dev/push_ctl "commit"        -> clunk peer fid, peer validates + requests upgrade
+ *   dev/push_ctl "reboot <eui>"  -> peer swaps to the new image
+ * `confirm` is done separately after the peer has booted (see mesh_ota.sh).
+ * chunk defaults to 256 so each host write is ONE mesh Twrite, spaced by the
+ * round-trip -- the peer's RX thread (which blocks sending its reliable reply)
+ * gets time to breathe between writes instead of dropping a back-to-back Twrite.
+ */
+static int do_mesh_ota(const char *eui, const char *file, int chunk)
+{
+	if (chunk <= 0 || chunk > 256) chunk = 256;
+	FILE *f = fopen(file, "rb");
+
+	if (!f) { perror("fopen"); return 1; }
+	long sz = 0;
+
+	fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+
+	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); fclose(f); return 1; }
+
+	char cmd[64];
+
+	/* Clear any stale push session left by an aborted run (idempotent). */
+	(void)ctl_write("dev/push_ctl", "commit");
+
+	printf("[1/4] target %s\n", eui);
+	snprintf(cmd, sizeof(cmd), "target %s", eui);
+	if (ctl_write("dev/push_ctl", cmd)) { fprintf(stderr, "target failed\n"); fclose(f); return 1; }
+
+	printf("[2/4] stream %s (%ld B, %d-byte mesh writes)\n", file, sz, chunk);
+	if (do_walk(0, 1, "dev/push")) { fprintf(stderr, "walk dev/push failed\n"); fclose(f); return 1; }
+	if (do_open(1, OWRITE)) { fprintf(stderr, "open dev/push failed\n"); do_clunk(1); fclose(f); return 1; }
+	uint8_t *blk = malloc(chunk);
+	uint64_t off = 0;
+	size_t r;
+	long t0 = now_ms();
+
+	const char *pace_s = getenv("MESH_OTA_PACE_US");
+	int pace_us = pace_s ? atoi(pace_s) : 60000;   /* settle between mesh writes */
+
+	while ((r = fread(blk, 1, chunk, f)) > 0) {
+		int w = do_pwrite(1, off, blk, (int)r);
+
+		if (w < 0) {
+			fprintf(stderr, "\nwrite failed at offset %llu\n", (unsigned long long)off);
+			free(blk); fclose(f); do_clunk(1); return 1;
+		}
+		off += w;
+		if (pace_us > 0) usleep(pace_us);   /* let the peer's RX thread free up */
+		if ((off & 0x1fff) == 0 || (size_t)w < r) {
+			printf("\r  %llu / %ld B (%.0f%%)", (unsigned long long)off, sz,
+			       sz ? 100.0 * off / sz : 0);
+			fflush(stdout);
+		}
+	}
+	printf("\r[ok] streamed %llu B in %ld ms\n", (unsigned long long)off, now_ms() - t0);
+	free(blk); fclose(f);
+	do_clunk(1);
+
+	printf("[3/4] commit (peer validates + requests upgrade)\n");
+	if (ctl_write("dev/push_ctl", "commit")) { fprintf(stderr, "commit failed\n"); return 1; }
+
+	printf("[4/4] reboot %s (peer swaps)\n", eui);
+	snprintf(cmd, sizeof(cmd), "reboot %s", eui);
+	(void)ctl_write("dev/push_ctl", cmd);   /* peer resets mid-reply; ignore RC */
+
+	do_clunk(0);
+	printf("[done] image pushed to %s over the mesh; confirm after it boots\n", eui);
+	return 0;
+}
+
 /* Open a conversation, fire a blocking data read, and HOLD it (never tear down)
  * so the caller can kill us mid-read -- the test for the async-worker epoch
  * guard: on disconnect the read's worker must not inject a stale reply into a
@@ -830,13 +917,18 @@ int main(int argc, char **argv)
 	int put = arg2 && strcmp(arg2, "--put") == 0;
 	int bridge = arg2 && strcmp(arg2, "--bridge") == 0;
 	int probe = arg2 && strcmp(arg2, "--probe") == 0;
-	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || bsend || bsendn || crecv || iso || sendn || sendbig || asend || bridge || probe) ? NULL : arg2;
+	int mesh_ota = arg2 && strcmp(arg2, "--mesh-ota") == 0;
+	const char *peer = (concurrent || put || hold || recv || brecv || bstatus || bsend || bsendn || crecv || iso || sendn || sendbig || asend || bridge || probe || mesh_ota) ? NULL : arg2;
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	strncpy(a.sun_path, sock, sizeof(a.sun_path) - 1);
 	if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { perror("connect"); return 1; }
 
+	if (mesh_ota) {
+		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --mesh-ota <peer_eui12> <signed.bin> [chunk]\n", argv[0]); return 2; }
+		return do_mesh_ota(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 256);
+	}
 	if (put) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --put <path> <file> [chunk]\n", argv[0]); return 2; }
 		return do_put(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 1024);

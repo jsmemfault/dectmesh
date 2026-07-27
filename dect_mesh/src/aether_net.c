@@ -1108,7 +1108,13 @@ static int m9_open_devfile(struct aether_conv *c, uint16_t *tag,
 int aether_net_push_open(const uint8_t peer_eui[6])
 {
 	if (g_push.active) {
-		return -EBUSY;
+		/* A prior push was aborted without a commit -- tear it down so a fresh
+		 * target never wedges on a stale session (idempotent, self-healing). */
+		k_mutex_lock(&g_fs.lock, K_FOREVER);
+		conv_free(g_push.conv);
+		k_mutex_unlock(&g_fs.lock);
+		g_push.active = false;
+		g_push.conv = NULL;
 	}
 	k_mutex_lock(&g_fs.lock, K_FOREVER);
 	struct aether_conv *c = conv_alloc();
@@ -1147,36 +1153,65 @@ int aether_net_push_write(const uint8_t *buf, uint32_t count, uint64_t offset)
 	if (!g_push.active) {
 		return -EPIPE;
 	}
-	/* Twrite header = size[4]+type[1]+tag[2]+fid[4]+offset[8]+count[4] = 23. */
+	/* Twrite header = size[4]+type[1]+tag[2]+fid[4]+offset[8]+count[4] = 23.
+	 * Cap the data so the whole 9P Twrite stays well within the mesh payload the
+	 * reliable path actually carries (the drain proved ~356-byte datagrams; a full
+	 * 448 wedged the send). Static buffers: one push session at a time, no reentry. */
 	const uint32_t hdr = 23;
-	const uint32_t maxdata = AETHER_MAX_MSG - hdr;
-	uint8_t msg[AETHER_MAX_MSG];
-	uint8_t rbuf[AETHER_MAX_MSG];
+	uint32_t maxdata = AETHER_MAX_MSG - hdr;
+
+	if (maxdata > 256) { maxdata = 256; }
+	static uint8_t msg[AETHER_MAX_MSG];
+	static uint8_t rbuf[64];
 	uint32_t done = 0;
+
+	extern int g_drain_sr;
 
 	while (done < count) {
 		uint32_t n = count - done;
 
 		if (n > maxdata) { n = maxdata; }
 
-		int o = 4;
+		/* The peer's mesh 9P server sends its reply with a BLOCKING reliable
+		 * unicast on its RX thread (aether_9p_mesh), so while it is finishing the
+		 * previous Rwrite it cannot receive+ACK our next Twrite -> our send times
+		 * out (sr=-ETIMEDOUT). Two mitigations: settle briefly so the peer frees
+		 * up first, and -- because a send that never got ACKed was never delivered
+		 * (the peer did NOT process it) -- safely retry the whole Twrite with a
+		 * fresh tag. Only a delivered-but-reply-lost case would be ambiguous, and
+		 * the 11-byte Rwrite is itself sent reliably, so that is rare. */
+		int r = -1;
+		uint32_t wr = 0;
 
-		msg[o++] = 118; np16(msg + o, g_push.tag++); o += 2;   /* Twrite */
-		np32(msg + o, g_push.fid); o += 4;
-		np32(msg + o, (uint32_t)(offset + done)); o += 4;
-		np32(msg + o, (uint32_t)((offset + done) >> 32)); o += 4;
-		np32(msg + o, n); o += 4;
-		memcpy(msg + o, buf + done, n); o += n;
+		for (int attempt = 0; attempt < 10; attempt++) {
+			if (offset + done > 0 || attempt > 0) {
+				k_msleep(60 + attempt * 40);   /* settle + backoff */
+			}
+			int o = 4;
 
-		int r = m9_rpc(g_push.conv, msg, o, rbuf, sizeof(rbuf));
+			msg[o++] = 118; np16(msg + o, g_push.tag++); o += 2;   /* Twrite */
+			np32(msg + o, g_push.fid); o += 4;
+			np32(msg + o, (uint32_t)(offset + done)); o += 4;
+			np32(msg + o, (uint32_t)((offset + done) >> 32)); o += 4;
+			np32(msg + o, n); o += 4;
+			memcpy(msg + o, buf + done, n); o += n;
 
-		if (r < 11 || rbuf[4] != 119) {   /* Rwrite */
-			LOG_ERR("push: Twrite failed at off %llu (r=%d type=%d)",
-				offset + done, r, r > 4 ? rbuf[4] : -1);
+			r = m9_rpc(g_push.conv, msg, o, rbuf, sizeof(rbuf));
+			if (r >= 11 && rbuf[4] == 119) {   /* Rwrite */
+				wr = ng32(rbuf + 7);
+				break;
+			}
+			if (g_drain_sr >= 0) {
+				/* delivered but no/!Rwrite reply -- ambiguous, don't re-deliver. */
+				break;
+			}
+			/* sr<0: not delivered -> safe to retry. */
+		}
+		if (r < 11 || rbuf[4] != 119) {
+			LOG_ERR("push: Twrite failed at off %llu (r=%d sr=%d)",
+				offset + done, r, g_drain_sr);
 			return -EIO;
 		}
-		uint32_t wr = ng32(rbuf + 7);
-
 		if (wr == 0) { break; }
 		done += wr;
 		if (wr < n) { break; }   /* short write */
