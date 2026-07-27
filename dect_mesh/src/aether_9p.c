@@ -430,6 +430,56 @@ static int gen_mflt(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
 	}
 	return total;
 }
+
+/*
+ * dev/mflt_mesh -- relay EVERY in-range mesh peer's dev/mflt in ONE inter-chip
+ * read. For each active neighbor (addressed by its durable node_eui) this drains
+ * the peer's Memfault chunks OVER THE AIR, in-process (aether_net_drain_peer ->
+ * a mesh 9P client on a conversation, so no uart1 round-trips per op), and
+ * concatenates the self-describing DEV:/MC: streams. The gateway's relay/host
+ * then pulls the whole mesh's telemetry with a single read of this file instead
+ * of the host tunneling a 9P session per peer over uart1 (the load that saturated
+ * the inter-chip link). Bounded by peer count + a wall-clock budget so the read
+ * never blocks the relay too long; peers not reached this read come next cycle.
+ */
+static int gen_mflt_mesh(uint8_t *buf, size_t buf_size, uint64_t offset, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	if (offset || !g_mesh_ctx) {
+		return 0;   /* one drain per read op */
+	}
+	static const uint8_t zero_eui[6] = { 0 };
+	uint32_t start = k_uptime_get_32();
+	int total = 0, drained = 0, checked = 0;
+
+	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS; i++)
+		if (g_mesh_ctx->neighbors[i].active) checked++;
+	LOG_INF("mflt_mesh read: %d active neighbor(s)", checked);
+
+	for (int i = 0; i < CONFIG_AETHER_MAX_NEIGHBORS && drained < 3; i++) {
+		if (!g_mesh_ctx->neighbors[i].active) {
+			continue;
+		}
+		const uint8_t *eui = g_mesh_ctx->neighbors[i].node_eui;
+
+		if (memcmp(eui, zero_eui, 6) == 0) {
+			continue;   /* identity unknown -> can't address durably */
+		}
+		if (total + 512 > (int)buf_size) {
+			break;      /* leave headroom; remaining peers next read */
+		}
+		if (k_uptime_get_32() - start > 10000) {
+			break;      /* time budget: don't block the relay read too long */
+		}
+		int n = aether_net_drain_peer(eui, buf + total, buf_size - total);
+
+		if (n > 0) {
+			total += n;
+			drained++;
+		}
+	}
+	return total;
+}
 #endif /* CONFIG_MEMFAULT */
 
 /*
@@ -456,6 +506,8 @@ static int register_dev_aether(void)
 #if defined(CONFIG_MEMFAULT)
 	/* Memfault chunk export as a file -- read to drain, forward to the cloud. */
 	ninep_sysfs_register_file(&sysfs, "dev/mflt", gen_mflt, NULL);
+	/* ... and every in-range mesh peer's chunks, drained over the air in one read. */
+	ninep_sysfs_register_file(&sysfs, "dev/mflt_mesh", gen_mflt_mesh, NULL);
 #endif
 	return 0;
 }

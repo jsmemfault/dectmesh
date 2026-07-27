@@ -22,4 +22,11 @@ void *aether_net_get_ctx(void);
  * and conversation-rxq-full drops (the back-pressure signal). Any pointer NULL. */
 void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops);
 
+/* Drain a mesh peer's dev/mflt over the air, IN-PROCESS (no uart1 round-trips) --
+ * runs a full 9P client session to the peer's mesh 9P server over a conversation.
+ * Writes the peer's self-describing DEV:/MC: stream into out (cap); returns bytes
+ * written (>=0) or negative errno. Used by dev/mflt_mesh to relay every in-range
+ * peer's telemetry in one inter-chip read. */
+int aether_net_drain_peer(const uint8_t peer_eui[6], uint8_t *out, size_t cap);
+
 #endif /* AETHER_NET_H_ */

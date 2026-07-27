@@ -792,6 +792,139 @@ static const struct ninep_fs_ops aether_net_ops = {
 const struct ninep_fs_ops *aether_net_get_ops(void) { return &aether_net_ops; }
 void *aether_net_get_ctx(void) { return &g_fs; }
 
+/* ---- on-device mesh 9P client: drain a peer's dev/mflt over the air ---------
+ * Runs the whole 9P session (version/attach/walk/open/read) to <peer_eui>'s mesh
+ * 9P server IN-PROCESS over a conversation's reliable datagrams -- so NONE of it
+ * crosses the inter-chip uart1. Only the drained result crosses (once, when the
+ * relay reads dev/mflt_mesh). This replaces the host-driven bridge, whose every
+ * peer 9P op was a uart1 round-trip (dozens/cycle) that saturated the control
+ * plane and wedged the relay's reads. Runs in the 9P-server thread context that
+ * services the dev/mflt_mesh read; blocks on the conversation rxq, which the RX
+ * thread fills -- no uart1 in the loop. */
+static void np16(uint8_t *b, uint16_t v) { b[0] = v; b[1] = v >> 8; }
+static void np32(uint8_t *b, uint32_t v) { b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24; }
+static uint16_t ng16(const uint8_t *b) { return b[0] | (b[1] << 8); }
+static uint32_t ng32(const uint8_t *b) { return b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t)b[3] << 24); }
+
+/* Send one framed 9P T (msg[0..len), size stamped here) to the connected peer and
+ * return the tag-matched R datagram in rbuf (kept framed: type@4, tag@5, ...).
+ * Retries a lost T; discards stale/duplicate R's (the datagram channel is
+ * untagged at the mesh layer). Returns reply length, or <0 on failure. */
+static int m9_rpc(struct aether_conv *c, uint8_t *msg, int len, uint8_t *rbuf, int cap)
+{
+	np32(msg, (uint32_t)len);
+	uint16_t want = ng16(msg + 5);
+	uint8_t route[6];
+	const uint8_t *dst = c->peer;
+
+	if (aether_mesh_eui_to_addr(g_fs.iface, c->peer, route) == 0) {
+		dst = route;
+	}
+	for (int attempt = 0; attempt < 3; attempt++) {
+		int sr = aether_mesh_send_reliable(g_fs.iface, dst, msg, len,
+						   AETHER_NET_RETRIES);
+		if (sr < 0) {
+			if (attempt == 0) {
+				LOG_WRN("drain: send_reliable(%02x:%02x) = %d", dst[4], dst[5], sr);
+			}
+			continue;
+		}
+		for (int reads = 0; reads < 4; reads++) {
+			struct aether_dgram d;
+
+			if (k_msgq_get(&c->rxq, &d, K_MSEC(2500)) != 0) {
+				break;              /* no reply this attempt -> resend */
+			}
+			if (d.len == 0) {
+				return -1;          /* hangup/EOF */
+			}
+			if (d.len >= 7 && ng16(d.data + 5) == want) {
+				int n = MIN((int)d.len, cap);
+
+				memcpy(rbuf, d.data, n);
+				return n;
+			}
+			/* stale tag: keep reading within this attempt */
+		}
+	}
+	return -1;
+}
+
+int aether_net_drain_peer(const uint8_t peer_eui[6], uint8_t *out, size_t cap)
+{
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	struct aether_conv *c = conv_alloc();
+
+	k_mutex_unlock(&g_fs.lock);
+	if (!c) {
+		LOG_WRN("drain %02x:%02x: conv_alloc FAILED (pool full)", peer_eui[4], peer_eui[5]);
+		return -ENOSPC;
+	}
+	memcpy(c->peer, peer_eui, 6);
+	c->state = CONV_CONNECTED;
+
+	uint8_t msg[64];
+	uint8_t rbuf[AETHER_MAX_MSG];
+	uint16_t tag = 1;
+	int total = 0, o, r;
+
+	/* Tversion */
+	o = 4; msg[o++] = 100; np16(msg + o, 0xffff); o += 2;
+	np32(msg + o, AETHER_MAX_MSG); o += 4;
+	np16(msg + o, 6); o += 2; memcpy(msg + o, "9P2000", 6); o += 6;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	LOG_INF("drain %02x:%02x: version r=%d type=%d", peer_eui[4], peer_eui[5],
+		r, r > 4 ? rbuf[4] : -1);
+	if (r < 5 || rbuf[4] != 101) { goto done; }
+
+	/* Tattach fid 0 */
+	o = 4; msg[o++] = 104; np16(msg + o, tag++); o += 2;
+	np32(msg + o, 0); o += 4; np32(msg + o, 0xffffffffu); o += 4;
+	np16(msg + o, 1); o += 2; msg[o++] = 't'; np16(msg + o, 0); o += 2;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 105) { goto done; }
+
+	/* Twalk fid 0 -> 2: ["dev","mflt"] (one round-trip) */
+	o = 4; msg[o++] = 110; np16(msg + o, tag++); o += 2;
+	np32(msg + o, 0); o += 4; np32(msg + o, 2); o += 4;
+	np16(msg + o, 2); o += 2;
+	np16(msg + o, 3); o += 2; memcpy(msg + o, "dev", 3); o += 3;
+	np16(msg + o, 4); o += 2; memcpy(msg + o, "mflt", 4); o += 4;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 111) { goto done; }   /* Rwalk=111 */
+
+	/* Topen fid 2 OREAD */
+	o = 4; msg[o++] = 112; np16(msg + o, tag++); o += 2;
+	np32(msg + o, 2); o += 4; msg[o++] = 0;
+	r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+	if (r < 5 || rbuf[4] != 113) { goto done; }   /* Ropen=113 */
+
+	/* Tread loop: drain successive chunk batches (the gen is stateful, so a
+	 * repeated offset-0 read yields the next batch until empty). */
+	for (int i = 0; i < 16 && total < (int)cap - 8; i++) {
+		uint32_t want_n = (uint32_t)(AETHER_MAX_MSG - 16);
+
+		o = 4; msg[o++] = 116; np16(msg + o, tag++); o += 2;
+		np32(msg + o, 2); o += 4;
+		np32(msg + o, 0); o += 4; np32(msg + o, 0); o += 4;
+		np32(msg + o, want_n); o += 4;
+		r = m9_rpc(c, msg, o, rbuf, sizeof(rbuf));
+		if (r < 11 || rbuf[4] != 117) { break; }  /* Rread=117 */
+		uint32_t n = ng32(rbuf + 7);
+
+		if ((int)n > r - 11) { n = r - 11; }
+		if ((int)n > (int)cap - 1 - total) { n = cap - 1 - total; }
+		if (n == 0) { break; }
+		memcpy(out + total, rbuf + 11, n);
+		total += n;
+	}
+done:
+	k_mutex_lock(&g_fs.lock, K_FOREVER);
+	conv_free(c);
+	k_mutex_unlock(&g_fs.lock);
+	return total;
+}
+
 void aether_net_get_stats(uint32_t *data_tx, uint32_t *data_rx, uint32_t *rxq_drops)
 {
 	if (data_tx) {

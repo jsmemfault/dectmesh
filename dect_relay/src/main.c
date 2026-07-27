@@ -1301,6 +1301,30 @@ static int mflt9151_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
 	(void)ninep_client_clunk(&mesh_client, fid);
 	return ret;
 }
+
+/* dev/mflt_mesh -- proxy the 9151's dev/mflt_mesh: EVERY in-range mesh peer's
+ * Memfault chunks, drained over the air ON the 9151 (in-process, no uart1 per
+ * op) and returned in one read. So the host pulls the whole mesh's telemetry
+ * with a single inter-chip read instead of tunneling a 9P session per peer --
+ * the fix for the uart1 saturation that wedged the mesh-relay gateway. The read
+ * can block a few seconds while the 9151 drains peers; ninep_client_read's long
+ * Tread timeout covers it. Self-describing pass-through, same as mflt9151. */
+static int mflt_mesh_read(uint8_t *buf, size_t buf_size, uint64_t off, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	uint32_t fid;
+	int ret = fw9151_open_remote("dev/mflt_mesh", NINEP_OREAD, &fid);
+
+	if (ret < 0) {
+		return ret;
+	}
+	ret = ninep_client_read(&mesh_client, fid, off, buf, buf_size);
+	if (ret >= 0) {
+		mesh_note_contact();
+	}
+	(void)ninep_client_clunk(&mesh_client, fid);
+	return ret;
+}
 #endif /* CONFIG_MEMFAULT */
 
 /*
@@ -1384,6 +1408,7 @@ static int fw_9p_init(void)
 	 * POSTs to Memfault -- coredumps + metrics from two chips, one 9P interface. */
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt5340", mflt5340_read, NULL);
 	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt9151", mflt9151_read, NULL);
+	(void)ninep_sysfs_register_file(&fw_sysfs, "dev/mflt_mesh", mflt_mesh_read, NULL);
 #endif
 
 	/* dev/fw9151auto: toggle post-swap auto-confirm of the 9151 (default on). */

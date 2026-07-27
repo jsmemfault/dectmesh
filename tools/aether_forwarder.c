@@ -621,39 +621,29 @@ static int cycle(void)
 	int nine_ok = (r != RC_TIMEOUT);
 	if (r > 0) total += forward_stream(buf);
 
-	/* Discover in-range peers from the neighbor table. */
-	char cgas[16][24];
-	int npeers = 0;
-	r = read_file("dev/aether/neighbors", buf, sizeof(buf));
+	/* Every in-range mesh peer, drained ON the 9151 (in-process, over the air)
+	 * and returned in ONE read -- no host-driven per-peer 9P tunnel over uart1.
+	 * This is the on-device peer-drain: the mesh session cost stays on the mesh,
+	 * only the result crosses the inter-chip link, once. Self-describing, so it
+	 * forwards through the same generic loop. This read can block a few seconds
+	 * while the 9151 drains peers (the relay's Tread timeout is 5 min). */
+	snprintf(g_where, sizeof(g_where), "dev/mflt_mesh");
+	r = read_file("dev/mflt_mesh", buf, sizeof(buf));
 	if (r == RC_ERR) return RC_ERR;
-	if (r > 0) npeers = parse_peers(buf, cgas, 16);
-	else if (r == RC_TIMEOUT) nine_ok = 0;
+	if (r == RC_TIMEOUT) nine_ok = 0;
+	int peer_chunks = (r > 0) ? forward_stream(buf) : 0;
+	total += peer_chunks;
 
 	/* uart-wedge signal: the 9151 side is unreadable while the relay answered. */
 	if (relay_ok && !nine_ok)
 		logline("  ! 9151/mesh side not responding (uart link degraded) -- relay-only this cycle");
 
-	if (npeers > 0) {
-		char list[400] = "";
-		for (int i = 0; i < npeers; i++) { strncat(list, " ", sizeof(list) - strlen(list) - 1); strncat(list, cgas[i], sizeof(list) - strlen(list) - 1); }
-		logline("  discovered %d peer(s):%s", npeers, list);
-	}
-
-	/* Each in-range peer, over the mesh. */
-	int peer_hits = 0;
-	for (int i = 0; i < npeers && !g_stop; i++) {
-		snprintf(g_where, sizeof(g_where), "peer %s", cgas[i]);
-		int pr = read_peer_mflt(cgas[i], buf, sizeof(buf));
-		if (pr == RC_ERR) return RC_ERR;
-		if (pr > 0) { int got = forward_stream(buf); total += got; if (got) peer_hits++; logline("    relayed %s (%dB)", cgas[i], pr); }
-	}
-
 	dev_age();
 
 	int active = 0;
 	for (int i = 0; i < ndev; i++) if (devs[i].active) active++;
-	logline("cycle: %d chunk(s) posted, %d peer(s) in range (%d relayed), %d device(s) active",
-		total, npeers, peer_hits, active);
+	logline("cycle: %d chunk(s) posted (%d from mesh peers), %d device(s) active",
+		total, peer_chunks, active);
 	return 0;
 }
 
