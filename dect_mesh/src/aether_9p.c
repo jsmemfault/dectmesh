@@ -309,6 +309,8 @@ static int dfu_write_confirm(const uint8_t *buf, uint32_t count, uint64_t off, v
 	return ret < 0 ? ret : count;
 }
 
+extern bool aether_9p_mesh_serving(void);
+
 static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 {
 	ARG_UNUSED(bytes);
@@ -316,7 +318,21 @@ static void dfu_status(enum ninep_dfu_state state, uint32_t bytes, int err)
 	 * the low-priority flash-write thread isn't starved by RX/HONR and a chunk's
 	 * Rwrite doesn't miss the relay's timeout ("write failed"). Released on
 	 * complete/error; the node reboots to apply. This is the "RF must never block
-	 * a wired OTA" guarantee. See aether_mesh_set_dfu_active. */
+	 * a wired OTA" guarantee. See aether_mesh_set_dfu_active.
+	 *
+	 * EXCEPTION -- OTA OVER THE MESH: when this DFU write arrives via the mesh 9P
+	 * server, the mesh IS the transport carrying the image, so quiescing it would
+	 * drop every subsequent Twrite (the classic "write#1 ok, write#2 sr=-116").
+	 * Detect that (aether_9p_mesh_serving) and DON'T touch the mesh -- the wired
+	 * path is unaffected (serving==false there) and still quiesces. */
+	if (aether_9p_mesh_serving()) {
+		if (state == NINEP_DFU_COMPLETE) {
+			LOG_INF("fw9151 DFU (over mesh): complete - reboot to apply");
+		} else if (state == NINEP_DFU_ERROR) {
+			LOG_ERR("fw9151 DFU (over mesh): error %d", err);
+		}
+		return;
+	}
 	switch (state) {
 	case NINEP_DFU_ERASING:
 		aether_mesh_set_dfu_active(true);

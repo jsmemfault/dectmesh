@@ -53,6 +53,17 @@ static atomic_t req_busy;
 static K_THREAD_STACK_DEFINE(mesh9p_stack, 4096);
 static struct k_work_q mesh9p_workq;
 
+/* True while a request is being served BY the mesh 9P server. dfu_status checks
+ * this: a DFU write arriving over the mesh must NOT quiesce the mesh (the mesh is
+ * the transport carrying the image -- quiescing it kills every subsequent Twrite).
+ * The wired (uart/USB) DFU path leaves this false, so it still quiesces as before. */
+static atomic_t mesh9p_serving;
+
+bool aether_9p_mesh_serving(void)
+{
+	return atomic_get(&mesh9p_serving) != 0;
+}
+
 static void mesh9p_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -60,8 +71,10 @@ static void mesh9p_work_fn(struct k_work *work)
 	if (mesh_transport.recv_cb) {
 		/* The server processes the T and replies synchronously through
 		 * ops->send (a blocking reliable unicast) on this work thread. */
+		atomic_set(&mesh9p_serving, 1);
 		mesh_transport.recv_cb(&mesh_transport, req_buf, req_len,
 				       mesh_transport.user_data);
+		atomic_set(&mesh9p_serving, 0);
 	}
 	atomic_clear(&req_busy);
 }
