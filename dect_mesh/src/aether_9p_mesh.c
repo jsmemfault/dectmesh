@@ -49,7 +49,7 @@ static struct net_if *mesh_iface;
  * DFU transfer. Each incoming datagram is already ACKed at the mesh layer, so a
  * ring slot is a commitment to process it; the requester's window keeps the ring
  * from overflowing (WINDOW <= MESH9P_RING). */
-#define MESH9P_RING 12
+#define MESH9P_RING 8
 struct mesh9p_req {
 	uint8_t buf[CONFIG_AETHER_MAX_PAYLOAD];
 	size_t  len;
