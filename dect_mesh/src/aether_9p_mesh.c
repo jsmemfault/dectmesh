@@ -49,7 +49,7 @@ static struct net_if *mesh_iface;
  * DFU transfer. Each incoming datagram is already ACKed at the mesh layer, so a
  * ring slot is a commitment to process it; the requester's window keeps the ring
  * from overflowing (WINDOW <= MESH9P_RING). */
-#define MESH9P_RING 6
+#define MESH9P_RING 12
 struct mesh9p_req {
 	uint8_t buf[CONFIG_AETHER_MAX_PAYLOAD];
 	size_t  len;
@@ -117,6 +117,17 @@ static bool looks_like_9p_t(const uint8_t *data, size_t len)
 	return data[4] >= 100 && data[4] <= 126 && (data[4] & 1) == 0;
 }
 
+/* Transport flow-control gate (runs on the RX thread, before dedup/ACK): accept a
+ * 9P T-message only if the request ring has room. A refusal is not ACKed, so the
+ * sender's ARQ retransmits -- lossless backpressure. Non-9P DATA always accepted. */
+static bool mesh9p_ack_gate(const uint8_t *payload, size_t len)
+{
+	if (!looks_like_9p_t(payload, len)) {
+		return true;
+	}
+	return atomic_get(&ring_count) < MESH9P_RING;
+}
+
 static void mesh9p_recv_cb(struct net_if *iface, const uint8_t src[6],
 			   const uint8_t *data, size_t len, bool broadcast,
 			   void *user_data)
@@ -130,6 +141,8 @@ static void mesh9p_recv_cb(struct net_if *iface, const uint8_t src[6],
 	k_spinlock_key_t k = k_spin_lock(&ring_lock);
 
 	if (atomic_get(&ring_count) >= MESH9P_RING) {
+		/* Should be rare now (the ack-gate refuses before ACK), but keep the
+		 * guard: if it fires, the gate + this node disagree momentarily -- drop. */
 		k_spin_unlock(&ring_lock, k);
 		LOG_WRN("9P/mesh ring full, dropping T type=%u from %02x:%02x",
 			data[4], src[4], src[5]);
@@ -235,6 +248,11 @@ int aether_9p_mesh_init(struct net_if *iface,
 		LOG_ERR("mesh 9P recv callback: %d", ret);
 		return ret;
 	}
+
+	/* Backpressure: refuse a 9P T-message at the transport (no ACK -> sender
+	 * retransmits) when our request ring is full, instead of accepting it (ACKed)
+	 * and then dropping it as "ring full" -- which silently loses a DFU chunk. */
+	aether_mesh_set_ack_gate(mesh9p_ack_gate);
 
 	LOG_INF("9P server up over the mesh (msize <= %u, reliable unicast)",
 		(unsigned int)CONFIG_AETHER_MAX_PAYLOAD);
