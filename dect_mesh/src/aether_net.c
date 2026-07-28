@@ -1058,8 +1058,34 @@ static struct {
 	uint32_t fid;       /* peer's open dev/firmware fid */
 	uint16_t tag;
 	uint64_t woff;      /* bytes streamed so far */
+	int      outstanding; /* Twrites delivered but not yet Rwrite-confirmed (window) */
 	bool     active;
 } g_push;
+
+/* Windowed DFU streaming: keep this many mesh writes in flight (the peer's ring is
+ * MESH9P_RING=6, so stay under it). The Rwrite replies are best-effort flow-control;
+ * transport ARQ guarantees each Twrite is delivered exactly once, and MCUboot's
+ * signature check on the complete image is the real integrity gate. */
+#define PUSH_WINDOW 4
+
+/* Drain best-effort Rwrite replies from the conv rxq, decrementing the window.
+ * `wait_ms` > 0 blocks for at least one (to open a window slot); 0 is a sweep. */
+static void push_reap(struct aether_conv *c, int wait_ms)
+{
+	struct aether_dgram d;
+
+	for (;;) {
+		int gr = k_msgq_get(&c->rxq, &d, wait_ms > 0 ? K_MSEC(wait_ms) : K_NO_WAIT);
+
+		if (gr != 0) {
+			break;
+		}
+		if (g_push.outstanding > 0) {
+			g_push.outstanding--;
+		}
+		wait_ms = 0;   /* after the first, only sweep what's already queued */
+	}
+}
 
 /* Build a 9P session on conv c up to an open fid 2 for dev/<file> with `mode`.
  * version -> attach(fid 0) -> walk(0->2 ["dev", file]) -> open(fid 2, mode).
@@ -1141,52 +1167,60 @@ int aether_net_push_open(const uint8_t peer_eui[6])
 	memcpy(g_push.peer, peer_eui, 6);
 	g_push.fid = 2;
 	g_push.woff = 0;
+	g_push.outstanding = 0;
 	g_push.active = true;
-	LOG_INF("push %02x:%02x: dev/firmware open, streaming", peer_eui[4], peer_eui[5]);
+	LOG_INF("push %02x:%02x: dev/firmware open, windowed streaming", peer_eui[4], peer_eui[5]);
 	return 0;
 }
 
-/* Stream `count` bytes at `offset` to the peer's dev/firmware, splitting into
- * mesh-payload-sized Twrites. Returns bytes accepted (>=0) or negative. */
+/*
+ * Stream `count` bytes at `offset` to the peer's dev/firmware -- WINDOWED. Each
+ * mesh Twrite is sent transport-reliable (exactly-once delivery), but we do NOT
+ * wait for its 9P Rwrite reply before sending the next: we keep up to PUSH_WINDOW
+ * in flight and reap the best-effort Rwrites (flow control) to slide the window,
+ * which the peer's request ring (MESH9P_RING) absorbs without dropping. This turns
+ * the per-chunk round-trip (send + reply) into a pipeline -- the throughput fix.
+ * Delivery is guaranteed by the ARQ; integrity by MCUboot's signature at boot.
+ * Returns bytes accepted (>=0) or negative.
+ */
 int aether_net_push_write(const uint8_t *buf, uint32_t count, uint64_t offset)
 {
 	if (!g_push.active) {
 		return -EPIPE;
 	}
-	/* Twrite header = size[4]+type[1]+tag[2]+fid[4]+offset[8]+count[4] = 23.
-	 * Cap the data so the whole 9P Twrite stays well within the mesh payload the
-	 * reliable path actually carries (the drain proved ~356-byte datagrams; a full
-	 * 448 wedged the send). Static buffers: one push session at a time, no reentry. */
+	/* Twrite header = size[4]+type[1]+tag[2]+fid[4]+offset[8]+count[4] = 23. Leave
+	 * headroom under AETHER_MAX_PAYLOAD for the mesh/ARQ header on the wire. */
 	const uint32_t hdr = 23;
 	uint32_t maxdata = AETHER_MAX_MSG - hdr;
 
-	if (maxdata > 256) { maxdata = 256; }
+	if (maxdata > 384) { maxdata = 384; }
 	static uint8_t msg[AETHER_MAX_MSG];
-	static uint8_t rbuf[64];
 	uint32_t done = 0;
 
 	extern int g_drain_sr;
+
+	/* Resolve the peer's route once per block (cheaper than per chunk). */
+	uint8_t route[6];
+	const uint8_t *dst = g_push.conv->peer;
+
+	if (aether_mesh_eui_to_addr(g_fs.iface, g_push.conv->peer, route) == 0) {
+		dst = route;
+	}
 
 	while (done < count) {
 		uint32_t n = count - done;
 
 		if (n > maxdata) { n = maxdata; }
 
-		/* The peer's mesh 9P server sends its reply with a BLOCKING reliable
-		 * unicast on its RX thread (aether_9p_mesh), so while it is finishing the
-		 * previous Rwrite it cannot receive+ACK our next Twrite -> our send times
-		 * out (sr=-ETIMEDOUT). Two mitigations: settle briefly so the peer frees
-		 * up first, and -- because a send that never got ACKed was never delivered
-		 * (the peer did NOT process it) -- safely retry the whole Twrite with a
-		 * fresh tag. Only a delivered-but-reply-lost case would be ambiguous, and
-		 * the 11-byte Rwrite is itself sent reliably, so that is rare. */
-		int r = -1;
-		uint32_t wr = 0;
+		/* Send this Twrite transport-reliable (exactly-once delivery). We do NOT
+		 * wait for its 9P Rwrite reply: the peer's request ring absorbs a burst and
+		 * it processes far faster (flash buffer-copy) than we can send (a mesh
+		 * round-trip per chunk), so back-to-back sends never outrun it. send_reliable
+		 * itself is the pacing -- each returns only once the peer ACKed receipt.
+		 * Retry only on non-delivery (sr<0 == peer never got it, safe to re-send). */
+		int sr = -1;
 
-		for (int attempt = 0; attempt < 10; attempt++) {
-			if (offset + done > 0 || attempt > 0) {
-				k_msleep(60 + attempt * 40);   /* settle + backoff */
-			}
+		for (int attempt = 0; attempt < 12 && sr < 0; attempt++) {
 			int o = 4;
 
 			msg[o++] = 118; np16(msg + o, g_push.tag++); o += 2;   /* Twrite */
@@ -1195,26 +1229,17 @@ int aether_net_push_write(const uint8_t *buf, uint32_t count, uint64_t offset)
 			np32(msg + o, (uint32_t)((offset + done) >> 32)); o += 4;
 			np32(msg + o, n); o += 4;
 			memcpy(msg + o, buf + done, n); o += n;
+			np32(msg, (uint32_t)o);
 
-			r = m9_rpc(g_push.conv, msg, o, rbuf, sizeof(rbuf));
-			if (r >= 11 && rbuf[4] == 119) {   /* Rwrite */
-				wr = ng32(rbuf + 7);
-				break;
-			}
-			if (g_drain_sr >= 0) {
-				/* delivered but no/!Rwrite reply -- ambiguous, don't re-deliver. */
-				break;
-			}
-			/* sr<0: not delivered -> safe to retry. */
+			sr = aether_mesh_send_reliable(g_fs.iface, dst, msg, o, AETHER_NET_RETRIES);
+			g_drain_sr = sr;
 		}
-		if (r < 11 || rbuf[4] != 119) {
-			LOG_ERR("push: Twrite failed at off %llu (r=%d sr=%d)",
-				offset + done, r, g_drain_sr);
+		if (sr < 0) {
+			LOG_ERR("push: Twrite off %llu not delivered (sr=%d)", offset + done, sr);
 			return -EIO;
 		}
-		if (wr == 0) { break; }
-		done += wr;
-		if (wr < n) { break; }   /* short write */
+		done += n;
+		push_reap(g_push.conv, 0);   /* discard best-effort Rwrites; keep rxq clear */
 	}
 	g_push.woff = offset + done;
 	return (int)done;
@@ -1227,6 +1252,13 @@ int aether_net_push_close(void)
 	if (!g_push.active) {
 		return -EPIPE;
 	}
+	/* Let the peer's ring drain the last windowed writes before we finalize: reap
+	 * outstanding best-effort Rwrites (bounded wait). The Tclunk is reliable and
+	 * FIFO-ordered behind the queued writes, so it finalizes after they land. */
+	for (int i = 0; i < 16 && g_push.outstanding > 0; i++) {
+		push_reap(g_push.conv, 500);
+	}
+
 	uint8_t msg[16];
 	uint8_t rbuf[AETHER_MAX_MSG];
 	int o = 4;

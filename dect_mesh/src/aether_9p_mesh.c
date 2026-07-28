@@ -42,13 +42,25 @@ static struct ninep_transport mesh_transport;
 static struct ninep_server mesh_server;
 static struct net_if *mesh_iface;
 
-/* One T-message in flight at a time (9P is client-driven; our sessions are
- * strictly request-response). A busy drop simply looks like datagram loss to
- * the requester, whose T arrives again via its own retry discipline. */
-static uint8_t req_buf[CONFIG_AETHER_MAX_PAYLOAD];
-static size_t req_len;
-static uint8_t req_peer[6];
-static atomic_t req_busy;
+/* A small RING of pending T-messages instead of one-in-flight. The 9P server is
+ * processed serially on the workq (it has per-session fid state), but queuing a
+ * few requests lets a STREAMING requester (OTA) keep several writes in flight
+ * without the peer dropping the 2nd..Nth as "busy" -- the enabler for a windowed
+ * DFU transfer. Each incoming datagram is already ACKed at the mesh layer, so a
+ * ring slot is a commitment to process it; the requester's window keeps the ring
+ * from overflowing (WINDOW <= MESH9P_RING). */
+#define MESH9P_RING 6
+struct mesh9p_req {
+	uint8_t buf[CONFIG_AETHER_MAX_PAYLOAD];
+	size_t  len;
+	uint8_t peer[6];
+};
+static struct mesh9p_req ring[MESH9P_RING];
+static uint8_t ring_head;          /* consumer: next to process */
+static uint8_t ring_tail;          /* producer: next to fill */
+static atomic_t ring_count;
+static struct k_spinlock ring_lock;
+static uint8_t cur_peer[6];        /* peer of the request being served (mesh9p_send) */
 
 static K_THREAD_STACK_DEFINE(mesh9p_stack, 4096);
 static struct k_work_q mesh9p_workq;
@@ -68,22 +80,32 @@ static void mesh9p_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	if (mesh_transport.recv_cb) {
-		/* The server processes the T and replies synchronously through
-		 * ops->send (a blocking reliable unicast) on this work thread. */
-		atomic_set(&mesh9p_serving, 1);
-		mesh_transport.recv_cb(&mesh_transport, req_buf, req_len,
-				       mesh_transport.user_data);
-		atomic_set(&mesh9p_serving, 0);
+	/* Drain the ring in FIFO order. New arrivals during processing bump
+	 * ring_count and re-submit the work, so nothing is left behind. */
+	while (atomic_get(&ring_count) > 0) {
+		struct mesh9p_req *r = &ring[ring_head];
+
+		memcpy(cur_peer, r->peer, 6);
+		if (mesh_transport.recv_cb) {
+			/* Server processes the T and replies via ops->send. */
+			atomic_set(&mesh9p_serving, 1);
+			mesh_transport.recv_cb(&mesh_transport, r->buf, r->len,
+					       mesh_transport.user_data);
+			atomic_set(&mesh9p_serving, 0);
+		}
+		k_spinlock_key_t k = k_spin_lock(&ring_lock);
+
+		ring_head = (ring_head + 1) % MESH9P_RING;
+		k_spin_unlock(&ring_lock, k);
+		atomic_dec(&ring_count);
 	}
-	atomic_clear(&req_busy);
 }
 static K_WORK_DEFINE(mesh9p_work, mesh9p_work_fn);
 
 /* Does this unicast datagram look like a framed 9P T-message? */
 static bool looks_like_9p_t(const uint8_t *data, size_t len)
 {
-	if (len < 7 || len > sizeof(req_buf)) {
+	if (len < 7 || len > CONFIG_AETHER_MAX_PAYLOAD) {
 		return false;
 	}
 	uint32_t sz = data[0] | (data[1] << 8) | (data[2] << 16) |
@@ -105,14 +127,23 @@ static void mesh9p_recv_cb(struct net_if *iface, const uint8_t src[6],
 	if (broadcast || !looks_like_9p_t(data, len)) {
 		return;
 	}
-	if (atomic_test_and_set_bit(&req_busy, 0)) {
-		LOG_WRN("9P/mesh busy, dropping T type=%u from %02x:%02x",
+	k_spinlock_key_t k = k_spin_lock(&ring_lock);
+
+	if (atomic_get(&ring_count) >= MESH9P_RING) {
+		k_spin_unlock(&ring_lock, k);
+		LOG_WRN("9P/mesh ring full, dropping T type=%u from %02x:%02x",
 			data[4], src[4], src[5]);
 		return;
 	}
-	memcpy(req_buf, data, len);
-	req_len = len;
-	memcpy(req_peer, src, 6);
+	struct mesh9p_req *r = &ring[ring_tail];
+
+	ring_tail = (ring_tail + 1) % MESH9P_RING;
+	k_spin_unlock(&ring_lock, k);
+
+	memcpy(r->buf, data, len);
+	r->len = len;
+	memcpy(r->peer, src, 6);
+	atomic_inc(&ring_count);
 	k_work_submit_to_queue(&mesh9p_workq, &mesh9p_work);
 }
 
@@ -121,13 +152,19 @@ static int mesh9p_send(struct ninep_transport *transport, const uint8_t *buf,
 {
 	ARG_UNUSED(transport);
 
-	/* Reply reliably, but with a BOUNDED retry budget: req_busy is held for the
-	 * whole duration of this send, and while it is held every incoming T is dropped
-	 * as "busy". A long reply-ARQ stall (e.g. the requester's ACK is slow) therefore
-	 * blocks the NEXT request for seconds -- fatal to a streaming session (OTA) where
-	 * the requester's retransmit keeps hitting a busy peer. A short budget frees
-	 * req_busy fast; the requester's own retry covers the rare genuinely-lost R. */
-	int ret = aether_mesh_send_reliable(mesh_iface, req_peer, buf, len, 3);
+	/* Rwrite (type 119) is the DFU stream's per-chunk reply. We SUPPRESS it: the
+	 * requester (windowed pusher) never waits for it, delivery is guaranteed by the
+	 * Twrite's own transport ARQ (exactly-once) and integrity by MCUboot's signature.
+	 * Crucially, actually transmitting a reply per chunk HOGS this node's half-duplex
+	 * radio -- while it TXes the Rwrite it cannot RX+ACK the next incoming Twrite, so
+	 * the sender's send_reliable retries ~5x (~2 s/chunk, measured). Not sending the
+	 * reply frees the radio to receive the stream at full rate. Report success to the
+	 * server so its state stays consistent. Non-write R-messages (Rread/Rversion/...,
+	 * where a lost reply aborts the op) stay reliable. */
+	if (len > 4 && buf[4] == 119) {
+		return (int)len;
+	}
+	int ret = aether_mesh_send_reliable(mesh_iface, cur_peer, buf, len, 3);
 
 	return ret == 0 ? (int)len : ret;
 }
@@ -147,7 +184,7 @@ static int mesh9p_stop(struct ninep_transport *transport)
 static int mesh9p_get_mtu(struct ninep_transport *transport)
 {
 	ARG_UNUSED(transport);
-	return sizeof(req_buf);
+	return CONFIG_AETHER_MAX_PAYLOAD;
 }
 
 static const struct ninep_transport_ops mesh9p_ops = {
@@ -168,7 +205,7 @@ int aether_9p_mesh_init(struct net_if *iface,
 	 * datagram per message; get_mtu clamps the negotiated msize anyway). */
 	struct ninep_server_config sc = *base_sc;
 
-	sc.max_message_size = sizeof(req_buf);
+	sc.max_message_size = CONFIG_AETHER_MAX_PAYLOAD;
 
 	k_work_queue_start(&mesh9p_workq, mesh9p_stack,
 			   K_THREAD_STACK_SIZEOF(mesh9p_stack),
@@ -200,6 +237,6 @@ int aether_9p_mesh_init(struct net_if *iface,
 	}
 
 	LOG_INF("9P server up over the mesh (msize <= %u, reliable unicast)",
-		(unsigned int)sizeof(req_buf));
+		(unsigned int)CONFIG_AETHER_MAX_PAYLOAD);
 	return 0;
 }

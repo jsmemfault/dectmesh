@@ -345,7 +345,7 @@ static int ctl_write(const char *path, const char *str)
  */
 static int do_mesh_ota(const char *eui, const char *file, int chunk)
 {
-	if (chunk <= 0 || chunk > 256) chunk = 256;
+	if (chunk <= 0 || chunk > 1024) chunk = 1024;
 	FILE *f = fopen(file, "rb");
 
 	if (!f) { perror("fopen"); return 1; }
@@ -373,7 +373,7 @@ static int do_mesh_ota(const char *eui, const char *file, int chunk)
 	long t0 = now_ms();
 
 	const char *pace_s = getenv("MESH_OTA_PACE_US");
-	int pace_us = pace_s ? atoi(pace_s) : 60000;   /* settle between mesh writes */
+	int pace_us = pace_s ? atoi(pace_s) : 0;   /* settle between mesh writes */
 
 	int retries = 0;
 
@@ -941,7 +941,7 @@ int main(int argc, char **argv)
 
 	if (mesh_ota) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --mesh-ota <peer_eui12> <signed.bin> [chunk]\n", argv[0]); return 2; }
-		return do_mesh_ota(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 256);
+		return do_mesh_ota(argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 1024);
 	}
 	if (put) {
 		if (argc < 5) { fprintf(stderr, "usage: %s <sock> --put <path> <file> [chunk]\n", argv[0]); return 2; }
