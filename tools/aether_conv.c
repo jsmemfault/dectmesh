@@ -356,57 +356,81 @@ static int do_mesh_ota(const char *eui, const char *file, int chunk)
 	if (do_version() || do_attach(0)) { fprintf(stderr, "setup failed\n"); fclose(f); return 1; }
 
 	char cmd[64];
-
-	/* Clear any stale push session left by an aborted run (idempotent). */
-	(void)ctl_write("dev/push_ctl", "commit");
-
-	printf("[1/4] target %s\n", eui);
-	snprintf(cmd, sizeof(cmd), "target %s", eui);
-	if (ctl_write("dev/push_ctl", cmd)) { fprintf(stderr, "target failed\n"); fclose(f); return 1; }
-
-	printf("[2/4] stream %s (%ld B, %d-byte mesh writes)\n", file, sz, chunk);
-	if (do_walk(0, 1, "dev/push")) { fprintf(stderr, "walk dev/push failed\n"); fclose(f); return 1; }
-	if (do_open(1, OWRITE)) { fprintf(stderr, "open dev/push failed\n"); do_clunk(1); fclose(f); return 1; }
 	uint8_t *blk = malloc(chunk);
-	uint64_t off = 0;
-	size_t r;
-	long t0 = now_ms();
-
 	const char *pace_s = getenv("MESH_OTA_PACE_US");
 	int pace_us = pace_s ? atoi(pace_s) : 0;   /* settle between mesh writes */
+	const char *mp = getenv("MESH_OTA_PASSES");
+	int max_passes = mp ? atoi(mp) : 12;
+	long t0 = now_ms();
+	int total_retries = 0;
+	uint64_t resume_off = 0;   /* where to (re)start streaming */
+	int completed = 0;
 
-	int retries = 0;
-
-	while ((r = fread(blk, 1, chunk, f)) > 0) {
-		/* A failed dev/push write means the gateway's mesh Twrite to the peer was
-		 * never delivered (sr<0) -- the peer did NOT process it -- so re-sending the
-		 * SAME chunk at the SAME offset is safe. Retry generously: the peer is only
-		 * transiently busy (finishing its previous reliable reply). This is the
-		 * host-side equivalent of the firmware sender-retry, so it works even when
-		 * the gateway lacks it. */
-		int w = -1;
-
-		for (int attempt = 0; attempt < 15 && w < 0; attempt++) {
-			if (attempt > 0) { retries++; usleep(150000); }
-			w = do_pwrite(1, off, blk, (int)r);
+	/*
+	 * RESUMABLE streaming. A sustained transfer can hit a transient mesh wedge where
+	 * one chunk stops getting through. Rather than fail, we back up ~16 KB and RESUME:
+	 * the target's dfu_write is idempotent (skips offsets it already has) and its DFU
+	 * state persists across a re-target, so re-sending the small overlap is free and we
+	 * pick up from where the peer actually is. A brief pause between passes lets the
+	 * mesh recover from the saturation that caused the wedge. The gateway only runs a
+	 * ring-depth (~3 KB) ahead of the peer's written position, so 16 KB back is safe.
+	 */
+	for (int pass = 0; pass < max_passes && !completed; pass++) {
+		if (pass == 0) {
+			printf("[1/4] target %s\n", eui);
+		} else {
+			printf("[resume %d] from %llu B (%.0f%%) -- settling the mesh...\n",
+			       pass, (unsigned long long)resume_off, sz ? 100.0 * resume_off / sz : 0);
+			sleep(4);   /* let the mesh drain/recover before resuming */
 		}
-		if (w < 0) {
-			fprintf(stderr, "\nwrite failed at offset %llu (gave up)\n",
-				(unsigned long long)off);
-			free(blk); fclose(f); do_clunk(1); return 1;
+		/* Re-target each pass to re-establish the mesh session (the stall drops it).
+		 * KNOWN LIMITATION: re-target re-versions the peer's mesh 9P server, which
+		 * clunks the open dev/firmware fid, and dfu_clunk FINALIZES the DFU -- doing
+		 * that on the PARTIAL image mid-resume corrupts it (MCUboot then rejects the
+		 * slot). Correct fix = decouple DFU finalize from a fid clunk (finalize only
+		 * on an explicit commit), so a re-version doesn't prematurely finalize. */
+		snprintf(cmd, sizeof(cmd), "target %s", eui);
+		if (ctl_write("dev/push_ctl", cmd)) { fprintf(stderr, "target failed (pass %d)\n", pass); continue; }
+		if (do_walk(0, 1, "dev/push") || do_open(1, OWRITE)) {
+			fprintf(stderr, "open dev/push failed (pass %d)\n", pass); do_clunk(1); continue;
 		}
-		off += w;
-		if (pace_us > 0) usleep(pace_us);   /* let the peer's RX thread free up */
-		if ((off & 0x1fff) == 0 || (size_t)w < r) {
-			printf("\r  %llu / %ld B (%.0f%%)", (unsigned long long)off, sz,
+		if (pass == 0) printf("[2/4] stream %s (%ld B, %d-byte mesh writes)\n", file, sz, chunk);
+
+		fseek(f, (long)resume_off, SEEK_SET);
+		uint64_t off = resume_off;
+		size_t r;
+		int stalled = 0;
+
+		while ((r = fread(blk, 1, chunk, f)) > 0) {
+			int w = -1;
+
+			for (int attempt = 0; attempt < 15 && w < 0; attempt++) {
+				if (attempt > 0) { total_retries++; usleep(150000); }
+				w = do_pwrite(1, off, blk, (int)r);
+			}
+			if (w < 0) { stalled = 1; break; }   /* transient wedge -> resume from here */
+			off += w;
+			if (pace_us > 0) usleep(pace_us);
+			if ((off & 0x1fff) == 0 || (size_t)w < r) {
+				printf("\r  %llu / %ld B (%.0f%%)", (unsigned long long)off, sz,
+				       sz ? 100.0 * off / sz : 0);
+				fflush(stdout);
+			}
+		}
+		do_clunk(1);
+
+		if (!stalled && off >= (uint64_t)sz) {
+			completed = 1;
+			printf("\r[ok] streamed %ld B in %ld ms (%d retries, %d pass%s)\n",
+			       sz, now_ms() - t0, total_retries, pass + 1, pass ? "es" : "");
+		} else {
+			printf("\n[stall] at %llu B (%.0f%%)\n", (unsigned long long)off,
 			       sz ? 100.0 * off / sz : 0);
-			fflush(stdout);
+			resume_off = off > 16384 ? off - 16384 : 0;   /* back up; peer dedups overlap */
 		}
 	}
-	printf("\r[ok] streamed %llu B in %ld ms (%d write-retries)\n",
-	       (unsigned long long)off, now_ms() - t0, retries);
 	free(blk); fclose(f);
-	do_clunk(1);
+	if (!completed) { fprintf(stderr, "push failed after %d passes\n", max_passes); return 1; }
 
 	printf("[3/4] commit (peer validates + requests upgrade)\n");
 	if (ctl_write("dev/push_ctl", "commit")) { fprintf(stderr, "commit failed\n"); return 1; }
