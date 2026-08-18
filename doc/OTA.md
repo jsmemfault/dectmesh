@@ -68,6 +68,64 @@ the fix that fits this SiP.)
 **Older relay (< 0.38.17)** without the fix: stream client-side instead, with
 `tools/aether_conv --put dev/fw9151 <…/zephyr.signed.bin> 1024` (paced 1 KB chunks).
 
+## OTA over the mesh — no wires to the target at all
+
+The same "update is a file write" idea, but the file being written lives on a **remote node
+reachable only over the DECT NR+ mesh**. The gateway's 9151 runs an in-process 9P *client*
+session to a peer's mesh 9P server and streams the signed image straight into the peer's
+`dev/firmware` — then commits, reboots, and confirms it, **all over the air**. No USB, no
+debugger, no wires to the target. The peer needs **zero** new code: every node already
+serves its own `dev/firmware`/`dev/reboot`/`dev/confirm` over the mesh (`aether_9p_mesh`).
+
+```
+host ─9P/USB─▶ gateway 5340 ─9P/UART─▶ gateway 9151 ─mesh 9P (reliable unicast)─▶ peer 9151
+                                        (in-proc 9P client)      over the air        (dev/firmware)
+```
+
+### The recipe
+
+```sh
+# One process, one connection drives the whole cycle (target → stream → commit → reboot):
+socat UNIX-LISTEN:/tmp/9p.sock,fork /dev/cu.usbmodem1203,rawer &  sleep 2   # gateway *3 port
+tools/aether_conv /tmp/9p.sock --mesh-ota <peer_eui12> dect_mesh/build_thingy/.../zephyr.signed.bin 1024
+#   ... peer boots the new image ...
+tools/p9do /tmp/9p.sock "ws:dev/push_ctl:confirm <peer_eui12>"   # confirm OVER THE MESH (no rollback)
+```
+
+`--mesh-ota` is **resumable**: on a transient mesh wedge it backs up, lets the mesh settle,
+re-targets, and continues — the peer dedups the overlap (idempotent `dfu_write`). A clean
+push completes in **one pass** (~305 KB in ~56 s single-hop). `tools/mesh_ota_verify.sh <N>`
+runs a full hands-off cycle and returns PASS/FAIL by reading the peer's boot banner.
+
+### Reliability
+
+Measured **15/15 full-image (305 KB) OTAs over the mesh, 0 failures** on a healthy bench
+(2026-07-30): 14 back-to-back version bumps (0.7.70→0.7.83), all single-pass, ~51–108 s,
+**1 retry total**; plus one deliberately **interrupted-at-51%-then-resumed** push that still
+produced a **MCUboot-validated, bootable** image. Three target-side fixes make it correct:
+
+- **exactly-once `dfu_write`** (idempotent by offset) — a re-sent chunk after a lost ACK is
+  skipped, not appended twice, so the image can't shift.
+- **ack-gate backpressure** — the peer refuses a 9P T-frame *before* ACKing when its request
+  ring is full, so the sender's ARQ retransmits instead of the chunk being silently dropped.
+- **finalize decoupled from session-reset** — a resume re-versions the peer (Tversion), which
+  clunks the open DFU fid; that clunk no longer *finalizes* the partial image. Only an
+  explicit commit finalizes. (This is what makes a resumed image validate instead of corrupt.)
+
+And one gateway-side fix: the DFU-over-mesh path does **not** quiesce the mesh (the mesh *is*
+the transport here), unlike the wired path which still quiesces during a flash write.
+
+**Scope of the claim:** single-hop, single RF environment, N=15. Multi-hop OTA *through* a
+relay node and thousands-of-cycles endurance are not yet characterized. Sustained heavy load
+can still degrade a bench over many pushes — a power-cycle resets it; the resumable path
+rides through transient wedges.
+
+### Confirm-over-mesh + reboot notes
+- After any swap the new image boots in **test mode** (`confirmed no`) and reverts on the next
+  reboot unless confirmed. Confirm over the mesh: `ws:dev/push_ctl:confirm <eui>`.
+- Reading the peer's `dev/fw9151` immediately after its reboot can race the relay re-attach
+  (empty read); retry a few times with a short settle.
+
 ## Gotchas
 
 - **Pin the `*3` port; don't glob `*3`** — a connected Nordic DK is a J-Link with a serial
